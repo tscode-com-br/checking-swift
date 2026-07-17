@@ -1,0 +1,20 @@
+# Xcode / build
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# Projeto gerado pelo XcodeGen (regenerável a partir de project.yml)
+*.xcodeproj
+
+# CocoaPods / SPM (não usados na fundação — plano §5: nenhuma dependência externa)
+Pods/
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# Ferramenta portátil do XcodeGen (não versionar)
+.tools/

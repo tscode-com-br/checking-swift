@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>$(CHECKING_APP_NAME)</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<!-- Arimo (Google Fonts OFL) — usada SÓ nos textos do splash (versão + créditos). port_spec_ui_design_system §12. -->
+	<key>UIAppFonts</key>
+	<array>
+		<string>Arimo.ttf</string>
+	</array>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>pt-BR</string>
+	<key>MinimumOSVersion</key>
+	<string>$(IPHONEOS_DEPLOYMENT_TARGET)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+
+	<!-- Orientação: retrato (revisar orientação aprovada — plano §16.3). -->
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+
+	<!-- Background Modes (port_spec_background_orchestrator §9). Habilitar só o que é usado de verdade. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<string>fetch</string>
+		<string>processing</string>
+		<string>remote-notification</string>
+	</array>
+	<!-- Identificadores permitidos para BGTaskScheduler (devem casar com AppDelegate). -->
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>br.com.tscode.checking.refresh</string>
+		<string>br.com.tscode.checking.processing</string>
+	</array>
+
+	<!-- Descrições de uso (localizar em InfoPlist.strings nos 6 idiomas — port_spec_i18n §1). -->
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>O Checking usa sua localização para registrar check-in e check-out automáticos enquanto você usa o app.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Para registrar check-in/check-out automaticamente em segundo plano quando você entra e sai das áreas de trabalho, o Checking precisa de acesso à localização "Sempre".</string>
+	<key>NSCameraUsageDescription</key>
+	<string>O Checking usa a câmera apenas para gravar o vídeo de um acidente que você optar por registrar.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>O Checking usa o microfone apenas para gravar o áudio do vídeo de um acidente que você optar por registrar.</string>
+
+	<!-- Config do backend, populada pelo .xcconfig e lida por ApiConfig.fromBundle(). -->
+	<key>CHECKINGApiHost</key>
+	<string>$(CHECKING_API_HOST)</string>
+	<key>CHECKINGApiPrefix</key>
+	<string>$(CHECKING_API_PREFIX)</string>
+	<key>CHECKINGXClient</key>
+	<string>$(CHECKING_X_CLIENT)</string>
+	<key>CHECKINGApnsEnv</key>
+	<string>$(CHECKING_APNS_ENV)</string>
+</dict>
+</plist>

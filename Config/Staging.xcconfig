@@ -1,0 +1,7 @@
+#include "Shared.xcconfig"
+
+CHECKING_BUNDLE_ID = br.com.tscode.checking.staging
+CHECKING_APP_NAME = Checking Staging
+CHECKING_APNS_ENV = development
+
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) STAGING

@@ -1,0 +1,16 @@
+// Configurações comuns a Debug/Staging/Release. (Comentários // são válidos em .xcconfig;
+// evita-se apenas // dentro de VALORES — por isso a URL é montada em código a partir do host.)
+
+PRODUCT_NAME = Checking
+IPHONEOS_DEPLOYMENT_TARGET = 17.0
+SWIFT_VERSION = 6.0
+TARGETED_DEVICE_FAMILY = 1
+
+// Versão espelha o Android (gradle.properties: versionName 1.6.5 / versionCode 24).
+MARKETING_VERSION = 1.6.5
+CURRENT_PROJECT_VERSION = 24
+
+// Backend (sem esquema; o código monta https://{host}{prefix}/ — port_spec_network_contracts §1).
+CHECKING_API_HOST = tscode.com.br
+CHECKING_API_PREFIX = /api/web
+CHECKING_X_CLIENT = checking-ios

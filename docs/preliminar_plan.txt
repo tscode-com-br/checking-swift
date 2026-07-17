@@ -1,0 +1,335 @@
+## Resultado da primeira análise
+
+O aplicativo Android é muito mais do que uma interface de check-in. Ele é um sistema corporativo de presença e segurança operacional com cinco núcleos funcionais:
+
+1. Autenticação e cadastro de usuários.
+2. Check-in/check-out manual e automático por localização.
+3. Operação resiliente em segundo plano e sem internet.
+4. Transporte de pessoal.
+5. Modo acidente, incluindo vídeo e acionamento remoto de emergência.
+
+A pasta `ios` está vazia. Nenhum planejamento ou código Swift foi iniciado.
+
+## Arquitetura atual
+
+O Android usa:
+
+- Kotlin 2.2.20, Jetpack Compose e Material 3.
+- Arquitetura MVVM com `StateFlow`.
+- Hilt para injeção de dependências.
+- Retrofit/OkHttp e serialização Kotlin.
+- Cookies de sessão persistentes e criptografados.
+- DataStore para preferências.
+- Room para o histórico local de atividades.
+- WorkManager, foreground service, geofencing e alarmes.
+- CameraX para vídeo.
+- API em `https://tscode.com.br/api/web/`.
+- Versão atual `1.6.5`, `versionCode 24`.
+
+As dependências e configuração estão em `kotlin/app/build.gradle.kts` e `kotlin/gradle/libs.versions.toml`.
+
+A organização é boa para ser reproduzida em Swift:
+
+- `presentation`: telas, componentes e ViewModels.
+- `domain`: modelos, regras e casos de uso.
+- `data`: API, DTOs, repositórios e armazenamento.
+- `platform`: localização, câmera, notificações, background e logs.
+
+## Experiência visual
+
+A interface não segue simplesmente a aparência nativa padrão do Android. Ela foi desenhada para reproduzir o “Checking Web”:
+
+- Cabeçalho verde-petróleo `#0F766E`.
+- Fundo em gradiente cinza muito claro.
+- Marca-d’água Petrobras central com baixa opacidade.
+- Um grande cartão branco contendo todo o fluxo principal.
+- Bordas arredondadas e campos com brilho laranja ou verde.
+- Tema vermelho quando há um acidente ativo.
+- Layout edge-to-edge.
+- Splash verde com desenho animado do logotipo, versão e créditos.
+- Paleta, espaçamentos e tipografia definidos explicitamente.
+
+A tela principal é montada em `kotlin/app/src/main/java/br/com/tscode/checking/presentation/check/CheckScreen.kt`, e os tokens visuais estão em `Color.kt` e `Tokens.kt`.
+
+As imagens incluídas no manual são capturas largas do Checking Web, não capturas literais do Android em um iPhone. Portanto, para uma equivalência visual real, a fonte principal deverá ser a hierarquia Compose e seus tokens, usando as imagens do manual apenas como referência complementar.
+
+## Fluxo principal
+
+A tela principal apresenta, nesta ordem:
+
+- Último check-in e último check-out, sempre visíveis.
+- Avisos de acidente, quando aplicável.
+- Mensagens de status.
+- Localização GPS, quando o modo automático está ativo.
+- Campos “Chave”, “Senha” e engrenagem de ajustes.
+- Incentivo para ativar atividades automáticas no primeiro login.
+- Seleção de Check-In ou Check-Out.
+- Acesso ao transporte, quando habilitado pelo servidor.
+- Informe Normal ou Retroativo.
+- Seleção de projetos.
+- Seleção manual de local quando o automático está desligado ou a precisão é insuficiente.
+- Botão para registrar.
+- Botão de acidente.
+
+O aplicativo também possui telas ou modais para:
+
+- Cadastro de usuário.
+- Cadastro e alteração de senha.
+- Histórico completo.
+- Atividades automáticas e permissões.
+- Pausa programada.
+- Preferências de avisos.
+- Transporte.
+- Modo acidente.
+- Gravação de vídeo.
+- Manual.
+- Sobre.
+- Privacidade e proteção de dados.
+- Log local de atividades.
+
+## Autenticação
+
+A identificação é uma chave alfanumérica de quatro caracteres. A senha aceita entre 3 e 10 caracteres.
+
+O fluxo contempla:
+
+- Consulta da existência da chave.
+- Cadastro de senha para usuário existente.
+- Autocadastro para chave desconhecida.
+- Fila de aprovação administrativa.
+- Polling de aprovação a cada 10 segundos.
+- Login automático com senha salva.
+- Verificação da senha 800 ms depois da digitação.
+- Sessão baseada em cookie.
+- Logout e limpeza do cookie.
+- Relogin silencioso em segundo plano.
+- Remoção da conta no servidor.
+- Tratamento de contas cuja remoção é bloqueada.
+
+A lógica central está em `kotlin/app/src/main/java/br/com/tscode/checking/presentation/check/CheckViewModel.kt`.
+
+## Regras de check-in/check-out automático
+
+O servidor é a autoridade para determinar em qual localização o usuário está. O aplicativo envia latitude, longitude e precisão para `/check/location`; ele não reproduz a geometria das áreas localmente.
+
+O motor de decisão local trabalha com cinco respostas:
+
+- `MATCHED`
+- `ACCURACY_TOO_LOW`
+- `NOT_IN_KNOWN_LOCATION`
+- `OUTSIDE_WORKPLACE`
+- `NO_KNOWN_LOCATIONS`
+
+As principais regras são:
+
+- Usuário com último check-in, entrando na “Zona de CheckOut”: realiza check-out.
+- Usuário com último check-in, afastando-se do local de trabalho: check-out em “Fora do Local de Trabalho”.
+- Usuário com último check-out, entrando em área cadastrada: check-in.
+- Mudança entre duas áreas cadastradas: novo check-in na nova área.
+- Leituras repetidas na mesma área: não duplicam check-in.
+- Usuário já em check-in, próximo do trabalho mas fora de uma área: registra mudança para “Localização não Cadastrada”.
+- Usuário em check-out não faz check-in em localização não cadastrada.
+- “Zona Mista” alterna entre check-in e check-out, respeitando intervalo configurado pelo servidor.
+- Precisão insuficiente não gera atividade automática e libera o fallback manual.
+- Nunca devem ocorrer dois check-outs consecutivos.
+
+A fonte de verdade dessas regras é `kotlin/app/src/main/java/br/com/tscode/checking/domain/checkrules/AutoActivities.kt`.
+
+## Funcionamento Android em segundo plano
+
+O Android combina vários mecanismos, não apenas um timer:
+
+- Foreground service permanente, com notificação não dispensável.
+- Execução imediata ao iniciar o serviço.
+- Avaliação periódica a cada 15 minutos.
+- WorkManager de 15 minutos como watchdog.
+- Geofences de entrada e saída, sem expiração.
+- Avaliação quando o aplicativo volta ao primeiro plano.
+- Reinício após boot ou atualização.
+- Tentativa de reinício quando o usuário remove o app dos recentes.
+- Wake lock de até 60 segundos por avaliação.
+- Relogin silencioso em caso de sessão expirada.
+- Notificação de reautenticação com cooldown de uma hora.
+- Geofences do servidor em cache por uma hora.
+- Estado remoto em cache por 45 segundos.
+- Opções de localização em cache por 15 minutos.
+
+A cada avaliação periódica, o app:
+
+1. Confirma chave e sessão.
+2. Verifica se o automático está ativo e se há pausa programada.
+3. Faz uma leitura GPS preliminar.
+4. Ignora a avaliação se o deslocamento for menor que `max(50 m, 2 × precisão)`.
+5. Obtém uma posição de alta precisão por até 15 segundos.
+6. Consulta o matcher do servidor e o estado atual.
+7. Executa a matriz de situações.
+8. Envia o evento e notifica o usuário.
+
+Isso está concentrado em `BackgroundCheckOrchestrator.kt` e `AutoActivityForegroundService.kt`.
+
+## Pausa programada
+
+O padrão de instalação é:
+
+- Pausa diária das 20:00 às 07:00.
+- Suspensão integral aos sábados.
+- Suspensão integral aos domingos.
+
+Durante a pausa, o app não executa GPS, geofence ou verificações periódicas de presença. Ele agenda o próximo início ou fim e notifica o usuário nas transições.
+
+## Operação offline
+
+A resiliência offline é bastante elaborada:
+
+- Fila persistente limitada a 200 eventos.
+- Coordenadas GPS criptografadas em repouso.
+- Eventos preservam data e hora originais.
+- Cada evento tem UUID para idempotência.
+- Reprocessamento em ordem cronológica.
+- Sincronização automática quando a rede retorna.
+- Backoff exponencial.
+- Evento `Raw`: GPS capturado, mas servidor indisponível antes do matching.
+- Evento `Decided`: ação já decidida, mas envio falhou.
+- Backlogs antigos continuam no histórico, mas somente as últimas 24 horas preenchem os formulários operacionais.
+
+A implementação está em `PendingCheckEvent.kt` e `PendingCheckReplayer.kt`.
+
+## Transporte
+
+O transporte é uma superfície de tela cheia com:
+
+- Cadastro de endereço e ZIP de seis dígitos.
+- Solicitação regular para dias de semana.
+- Solicitação de fim de semana.
+- Transporte extra por data e horário.
+- Estados pendente, confirmado, rejeitado, cancelado e realizado.
+- Informações de veículo, placa, cor, horário e tolerância.
+- Ciência/acknowledgement do usuário.
+- Cancelamento.
+- Histórico.
+- Atualização por SSE.
+- Refresh de 30 segundos enquanto houver solicitações ativas.
+- Estado local para ocultar ou marcar solicitações como realizadas.
+
+A lógica está em `TransportViewModel.kt`.
+
+## Modo acidente
+
+O modo acidente é um subsistema relevante:
+
+- Qualquer usuário autenticado pode abrir um acidente.
+- Wizard: projeto → localização → descrição → situação → confirmação.
+- Local cadastrado ou localização livre.
+- Estados “Zona de Segurança” e “Zona de Acidente”.
+- Situação “OK” ou “Preciso de ajuda”.
+- Aviso em tempo real por SSE.
+- Polling de 30 segundos enquanto existe acidente.
+- Worker independente a cada 15 minutos, mesmo com atividades automáticas desligadas.
+- Fila de confirmação para novos acidentes.
+- Notificação local para acidentes ainda não vistos.
+- Acionamento do serviço de emergência pelo backend.
+- Gravação HD pela câmera traseira com áudio.
+- Upload MP4 com progresso e chave de idempotência.
+- Exclusão do arquivo temporário após upload bem-sucedido.
+- Alteração da interface para o tema vermelho.
+
+A lógica está em `AccidentViewModel.kt`.
+
+## Dados, segurança e privacidade
+
+O aplicativo guarda:
+
+- Idioma e chave.
+- Preferências por chave.
+- Projetos e projeto ativo.
+- Senhas criptografadas.
+- Cookies criptografados.
+- Preferências de transporte.
+- Consentimento para localização em segundo plano.
+- Acidentes já notificados.
+- Fila offline criptografada.
+- Log local de atividades.
+
+O log local retém no máximo 30 dias ou 5.000 registros.
+
+A política interna declara:
+
+- Controlador: Tamer Salmem.
+- Hospedagem em Singapura.
+- Idade mínima de 18 anos.
+- Sem publicidade, analytics ou SDKs de rastreamento.
+- Canal de privacidade por e-mail.
+- Exclusão local e exclusão de conta.
+- Consentimento destacado antes da localização em segundo plano.
+
+Há seis idiomas completos: português, inglês, chinês, malaio, indonésio e tagalog/filipino.
+
+## Cobertura de testes
+
+Encontrei 296 métodos `@Test` distribuídos em 38 arquivos. Eles cobrem, entre outros:
+
+- Matriz de situações.
+- Prevenção de duplicatas.
+- Preservação de check-out.
+- Zona mista.
+- Pausa programada.
+- Fila offline e replay.
+- Single-flight do orquestrador.
+- Persistência.
+- Autenticação.
+- UI smoke tests.
+- Notificações reais no Android.
+
+Esta análise foi estática; não executei a suíte nesta etapa.
+
+## Conclusão crítica sobre o iOS
+
+A interface e as regras de negócio podem ser reproduzidas com grande fidelidade em Swift. Entretanto, a afirmação “rodar em segundo plano exatamente como no Android” não pode significar igualdade de mecanismos internos.
+
+No iOS:
+
+- Aplicativos normalmente são suspensos pouco depois de irem ao segundo plano.
+- `BGAppRefreshTask` não garante execução a cada 15 minutos; o sistema escolhe o momento e concede uma janela curta de execução.
+- Core Location permite atualizações contínuas em segundo plano quando o modo `location` está habilitado e o acompanhamento começa adequadamente.
+- Geofencing pode despertar o aplicativo, mas há limite de 20 condições simultâneas.
+- Não existem equivalentes públicos a `START_STICKY`, `BOOT_COMPLETED`, wake lock, isenção de otimização de bateria ou foreground service Android.
+- Depois de reinício, desbloqueio, suspensão, encerramento pelo sistema ou encerramento explícito pelo usuário, as garantias são diferentes.
+- Serviços de localização em segundo plano precisam ser parte real da função do aplicativo e claramente explicados ao usuário e à revisão da App Store.
+
+Esses limites estão documentados pela Apple em:
+
+- https://developer.apple.com/documentation/corelocation/handling-location-updates-in-the-background
+- https://developer.apple.com/documentation/BackgroundTasks/choosing-background-strategies-for-your-app
+- https://developer.apple.com/documentation/CoreLocation/monitoring-the-user-s-proximity-to-geographic-regions
+- https://developer.apple.com/app-store/review/guidelines/
+
+As permissões iOS correspondentes serão, conceitualmente:
+
+- Localização “Durante o Uso”.
+- Localização “Sempre”.
+- Precisão exata.
+- Notificações.
+- Câmera.
+- Microfone.
+- Background Mode: Location Updates.
+- Possivelmente Background Processing e Remote Notifications, dependendo da estratégia futura.
+
+Câmera e microfone devem ser solicitados somente no momento da gravação, como o Android já faz. A Apple exige mensagens específicas em `Info.plist` para ambos:
+
+- https://developer.apple.com/documentation/avfoundation/requesting-authorization-to-capture-and-save-media
+- https://developer.apple.com/documentation/usernotifications/asking-permission-to-use-notifications
+
+## Pontos do código que não devem ser copiados cegamente
+
+Mesmo considerando o aplicativo funcional em produção, encontrei algumas ambiguidades objetivas:
+
+- O callback que deveria desligar atividades automáticas após falha no fluxo de acidente contém um `TODO` e não executa a desativação.
+- Um cenário de acidente recebe `state.userProjects != null` onde o nome do parâmetro indica que deveria receber o estado real das atividades automáticas.
+- A rotina denominada “auto-checkin do acidente” faz novas consultas, mas não submete diretamente um check-in; depende de outro fluxo atualizar o estado.
+- O upload de vídeo devolve `AppResult`, mas a UI trata a conclusão da função como sucesso sem verificar esse resultado.
+- Há comentários antigos dizendo que “localização sempre” é obrigatória, enquanto o comportamento atual permite iniciar apenas com notificações e localização precisa.
+- “Apagar dados deste dispositivo” limpa DataStore, senhas, cookies e Room, mas a fila offline atual usa um armazenamento criptografado separado que não possui limpeza explícita nesse fluxo.
+
+Isso não significa necessariamente que o funcionamento observado pelo usuário esteja quebrado. Significa que a implementação Swift precisa preservar o comportamento validado, não reproduzir literalmente inconsistências ou comentários obsoletos.
+
+Em resumo: compreendo a interface, os módulos, o contrato de API, a matriz de check-in/check-out, a resiliência offline, o modo acidente, o transporte e a operação Android em segundo plano. O principal desafio da versão iOS não será SwiftUI; será obter a maior equivalência operacional permitida pelo ciclo de vida e pelas políticas do iOS, sem prometer garantias que a plataforma Apple não oferece.

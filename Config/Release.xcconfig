@@ -1,0 +1,5 @@
+#include "Shared.xcconfig"
+
+CHECKING_BUNDLE_ID = br.com.tscode.checking
+CHECKING_APP_NAME = Checking
+CHECKING_APNS_ENV = production

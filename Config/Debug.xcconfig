@@ -1,0 +1,9 @@
+#include "Shared.xcconfig"
+
+CHECKING_BUNDLE_ID = br.com.tscode.checking.debug
+CHECKING_APP_NAME = Checking Dev
+CHECKING_APNS_ENV = development
+
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) DEBUG
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) DEBUG=1
+SWIFT_OPTIMIZATION_LEVEL = -Onone
