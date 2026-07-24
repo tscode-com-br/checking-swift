@@ -52,9 +52,20 @@ final class FakeAuthRepository: AuthRepository, @unchecked Sendable {
     func getHistory(_ chave: String) async -> AppResult<HistoryState> { lock.withLock { getHistoryCount += 1 }; return historyResult }
 }
 
-final class FakeProjectRepository: ProjectListing, @unchecked Sendable {
+final class FakeProjectRepository: ProjectRepository, @unchecked Sendable {
     var result: AppResult<[Project]> = .success([])
+    var userProjectsResult: AppResult<UserProjects> = .success(UserProjects(projects: ["P80"], activeProject: "P80"))
+    var updateUserProjectsResult: AppResult<UserProjects>?
+    private(set) var updateUserProjectsCalls: [[String]] = []
     func listProjects() async -> AppResult<[Project]> { result }
+    func getUserProjects() async -> AppResult<UserProjects> { userProjectsResult }
+    func updateUserProjects(_ projectNames: [String]) async -> AppResult<UserProjects> {
+        updateUserProjectsCalls.append(projectNames)
+        return updateUserProjectsResult ?? .success(UserProjects(projects: projectNames, activeProject: projectNames.first ?? ""))
+    }
+    func updateActiveProject(_ projectName: String) async -> AppResult<UserProjects> {
+        .success(UserProjects(projects: [projectName], activeProject: projectName))
+    }
 }
 
 final class SpyOrchestrator: OrchestratorRunning, @unchecked Sendable {
@@ -84,6 +95,28 @@ struct NoopCheckEventStream: CheckEventStreaming {
     func events(chave: String) -> AsyncStream<String> { AsyncStream { $0.finish() } }
 }
 
+actor SpySignificantLocationMonitor: SignificantLocationMonitoring {
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+    private var active = false
+    func start() { startCount += 1; active = true }
+    func stop() { stopCount += 1; active = false }
+    func isActive() -> Bool { active }
+}
+
+actor SpyGeofenceRegionManager: GeofenceRegionManaging {
+    private(set) var registrations: [(chave: String, hints: GeofencePriorityHints, forceRefresh: Bool)] = []
+    private(set) var unregisterCount = 0
+
+    func register(chave: String, hints: GeofencePriorityHints, forceRefresh: Bool) {
+        registrations.append((chave, hints, forceRefresh))
+    }
+
+    func unregisterAll() {
+        unregisterCount += 1
+    }
+}
+
 /// Harness dos testes do ViewModel — configure os fakes/prefs, depois `build()`.
 @MainActor
 final class VMHarness {
@@ -92,14 +125,31 @@ final class VMHarness {
     let auth = FakeAuthRepository()
     let projects = FakeProjectRepository()
     let orchestrator = SpyOrchestrator()
+    let significantLocationMonitor = SpySignificantLocationMonitor()
+    let geofenceRegionManager = SpyGeofenceRegionManager()
     let passwords = SpySecurePasswordStore()
     let checkRepository = FakeCheckRepository()
+    let captureLocation = FakeCaptureLocation(.noPermission)
+    let offlineQueue = FakeOfflineQueue()
+    let activityLog = ActivityLog(dao: CoreDataActivityLogDao(stack: CoreDataStack(inMemory: true)))
+    var permissions = PermissionsStatus(
+        locationAuthorization: .always, preciseAccuracy: true, cameraMicGranted: true,
+        notificationAuthorization: .authorized, lowPowerMode: false, backgroundRefresh: .available)
 
     func build() -> CheckViewModel {
         CheckViewModel(appPreferences: prefs, securePasswordStore: passwords, authRepository: auth,
-                       projectRepository: projects, checkRepository: checkRepository, orchestrator: orchestrator,
+                       projectRepository: projects, checkRepository: checkRepository,
+                       captureLocationUseCase: captureLocation, offlineQueue: offlineQueue,
+                       permissionsInspector: StaticPermissionsInspector(status: permissions), orchestrator: orchestrator,
+                       significantLocationMonitor: significantLocationMonitor,
                        checkEventStream: NoopCheckEventStream(), activityLogger: NoopActivityLogger(),
-                       clock: FixedClock(Date(timeIntervalSince1970: 0)))
+                       clock: FixedClock(Date(timeIntervalSince1970: 0)), activityLog: activityLog,
+                       geofenceRegionManager: geofenceRegionManager)
     }
     func teardown() { UserDefaults.standard.removePersistentDomain(forName: suiteName) }
+}
+
+struct StaticPermissionsInspector: PermissionsInspecting {
+    let status: PermissionsStatus
+    func inspect() async -> PermissionsStatus { status }
 }

@@ -101,4 +101,66 @@ final class VideoUploadTests: XCTestCase {
         XCTAssertEqual(api.uploadCalls.first?.idempotencyKey, "id-xyz")
         XCTAssertEqual(api.uploadCalls.first?.contentType, "video/mp4")
     }
+
+    func test_backgroundMultipartFile_containsExactFieldsAndVideoBytes() throws {
+        let video = FileManager.default.temporaryDirectory.appendingPathComponent("video_\(UUID()).mp4")
+        try Data("VIDEO-BYTES".utf8).write(to: video)
+        defer { try? FileManager.default.removeItem(at: video) }
+
+        let body = try BackgroundAccidentVideoUploader.makeMultipartBodyFile(
+            boundary: "Boundary-Test",
+            chave: "HR70",
+            idempotencyKey: "stable-key",
+            videoFile: video,
+            contentType: "video/mp4")
+        defer { try? FileManager.default.removeItem(at: body) }
+
+        let data = try Data(contentsOf: body)
+        let text = String(decoding: data, as: UTF8.self)
+        XCTAssertTrue(text.contains("name=\"chave\"\r\n\r\nHR70"))
+        XCTAssertTrue(text.contains("name=\"idempotency_key\"\r\n\r\nstable-key"))
+        XCTAssertTrue(text.contains("name=\"video\"; filename=\"\(video.lastPathComponent)\""))
+        XCTAssertTrue(text.contains("Content-Type: video/mp4"))
+        XCTAssertTrue(text.contains("VIDEO-BYTES"))
+        XCTAssertTrue(text.hasSuffix("--Boundary-Test--\r\n"))
+    }
+
+    func test_repository_usesBackgroundUploaderAndDecodesResponse() async throws {
+        let uploader = FakeAccidentVideoUploader()
+        uploader.responseData = Data(
+            #"{"video_id":9,"public_url":"https://x/9.mp4","captured_at":"2026-07-22T07:00:00Z"}"#.utf8)
+        let repo = AccidentRepositoryLive(
+            api: FakeAccidentApi(),
+            checkEventStream: CheckEventStream(makeStream: { _ in AsyncStream { $0.finish() } }),
+            videoUploader: uploader)
+        let video = FileManager.default.temporaryDirectory.appendingPathComponent("background_\(UUID()).mp4")
+        try Data("video".utf8).write(to: video)
+        defer { try? FileManager.default.removeItem(at: video) }
+
+        let result = await repo.uploadVideo(
+            chave: "HR70",
+            idempotencyKey: "stable-key",
+            videoFile: video,
+            contentType: "video/mp4") { _ in }
+
+        guard case .success(let value) = result else { return XCTFail("expected success") }
+        XCTAssertEqual(value.videoId, 9)
+        XCTAssertEqual(uploader.receivedChave, "HR70")
+        XCTAssertEqual(uploader.receivedIdempotencyKey, "stable-key")
+        XCTAssertEqual(uploader.receivedVideoFile, video)
+    }
+
+    func test_viewModel_reusesIdempotencyKeyWhenRetryingSameRecording() async {
+        let repository = FakeAccidentRepository()
+        repository.uploadResult = .failure(.network)
+        let viewModel = makeAccidentViewModel(repository: repository)
+        viewModel.onLogin("HR70")
+        let file = URL(fileURLWithPath: "/tmp/stable-retry.mp4")
+
+        _ = await viewModel.uploadVideo(file: file, contentType: "video/mp4") { _ in }
+        _ = await viewModel.uploadVideo(file: file, contentType: "video/mp4") { _ in }
+
+        XCTAssertEqual(repository.uploadCalls.count, 2)
+        XCTAssertEqual(repository.uploadCalls[0].idempotencyKey, repository.uploadCalls[1].idempotencyKey)
+    }
 }

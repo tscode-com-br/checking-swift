@@ -5,6 +5,7 @@ import Foundation
 struct AccidentRepositoryLive: AccidentRepository {
     let api: any AccidentApi
     let checkEventStream: CheckEventStream
+    var videoUploader: (any AccidentVideoUploading)? = nil
 
     func getState(_ chave: String) async -> AppResult<AccidentState> {
         await safeApiCall { try await api.getState(chave).toDomain() }
@@ -44,12 +45,27 @@ struct AccidentRepositoryLive: AccidentRepository {
     func uploadVideo(chave: String, idempotencyKey: String, videoFile: URL, contentType: String,
                      onProgress: @escaping @Sendable (Double) -> Void) async -> AppResult<VideoUploadResult> {
         await safeApiCall {
-            let videoData = try Data(contentsOf: videoFile)
-            onProgress(0)
-            let r = try await api.uploadVideo(chave: chave, idempotencyKey: idempotencyKey, videoData: videoData,
-                                              filename: videoFile.lastPathComponent, contentType: contentType)
-            onProgress(1)
-            try? FileManager.default.removeItem(at: videoFile)   // só chega aqui em sucesso — retido em falha
+            let r: AccidentVideoUploadResponse
+            if let videoUploader {
+                let responseData = try await videoUploader.upload(
+                    chave: chave,
+                    idempotencyKey: idempotencyKey,
+                    videoFile: videoFile,
+                    contentType: contentType,
+                    onProgress: onProgress)
+                r = try JSONCoding.decoder.decode(AccidentVideoUploadResponse.self, from: responseData)
+            } else {
+                let videoData = try Data(contentsOf: videoFile)
+                onProgress(0)
+                r = try await api.uploadVideo(
+                    chave: chave,
+                    idempotencyKey: idempotencyKey,
+                    videoData: videoData,
+                    filename: videoFile.lastPathComponent,
+                    contentType: contentType)
+                onProgress(1)
+                try? FileManager.default.removeItem(at: videoFile)
+            }
             return VideoUploadResult(videoId: r.videoId, publicUrl: r.publicUrl,
                                      capturedAt: ISOInstant.parse(r.capturedAt) ?? Date())
         }

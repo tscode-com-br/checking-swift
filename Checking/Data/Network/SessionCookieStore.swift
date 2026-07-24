@@ -84,3 +84,33 @@ final class InMemorySessionCookieStore: SessionCookieStore, @unchecked Sendable 
         lock.lock(); byHost.removeAll(); lock.unlock()
     }
 }
+
+/// Cookie jar persistente no Keychain. O JSON contém apenas o contrato `CookieRecord` e nunca é logado.
+/// Cada host ocupa uma conta separada para preservar o overwrite por host do Android.
+final class KeychainSessionCookieStore: SessionCookieStore, @unchecked Sendable {
+    static let defaultService = "br.com.tscode.checking.session-cookies"
+    private let keychain: KeychainStore
+    private let now: @Sendable () -> Int64
+
+    init(service: String = defaultService,
+         now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }) {
+        keychain = KeychainStore(service: service)
+        self.now = now
+    }
+
+    func cookieHeader(for url: URL) -> String? {
+        guard let host = url.host,
+              let data = keychain.data(for: host),
+              let records = try? JSONDecoder().decode([CookieRecord].self, from: data) else { return nil }
+        return SessionCookies.header(records, nowMillis: now())
+    }
+
+    func saveFromResponse(_ url: URL, headerFields: [String: String]) {
+        guard let host = url.host else { return }
+        let records = SessionCookies.parse(headerFields: headerFields, for: url)
+        guard !records.isEmpty, let data = try? JSONEncoder().encode(records) else { return }
+        _ = keychain.set(data, for: host)
+    }
+
+    func clear() { keychain.removeAll() }
+}

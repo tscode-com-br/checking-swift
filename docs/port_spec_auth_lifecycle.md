@@ -271,7 +271,7 @@ Chaves: `auth.awaitingApproval` (pt: "Aguardando aprovação de cadastro."), `au
 - [x] `selfRegister.found = (status == "registered")`; `chave` do argumento; 3 saídas (registered/pending/queue_full); senha **sempre** salva.
 - [x] `logout` sempre `.success` + limpa cookie; `deleteAccount` limpa cookie **só** em sucesso; **409 mantém sessão**.
 - [x] `handleAuthExpiry` mantém chave/senha; wipe do `deleteAccount` inclui **fila offline** — TODO(D6) marcado no código (`offlineQueue.clear()` ainda não ligado — falta plugar no `AppEnvironment`).
-- [x] Multi-conta: senhas/settings por chave (JSON/mapa); trocar chave restaura outro conjunto. Keychain real fica p/ slice de segurança.
+- [x] Multi-conta: senhas/settings por chave (JSON/mapa); trocar chave restaura outro conjunto. Senhas no Keychain real (`AfterFirstUnlockThisDeviceOnly`).
 - [x] Chaves de preferência e defaults idênticos; round-trip verbatim.
 - [x] Tons/i18n keys exatos; DTOs com defaults e snake_case.
 - [x] 41 testes portados e verdes (+ 3 regressão de revisão + 5 `SecurePasswordStoreTests`).
@@ -282,6 +282,11 @@ chave `4` (uppercase alfanum.) · senha criar `3..10` / verificar `1..10` · deb
 ## 13. Implementação (slice, 2026-07-16)
 
 Implementado e verde (305 testes): `ClientStateFunctions`/`UserSettings`/`resolveFallbackProjects`/`resolveFallbackActiveProject` (funções puras), `AuthStatus`, DTOs de auth, `AuthApi`/`AuthApiLive`, `AuthRepository`/`AuthRepositoryLive` (mapeamento 1:1), `UserDefaultsPreferencesStore`, `InMemorySecurePasswordStore` (backend cifrado real adiado), `CheckUiState`, `CheckViewModel` (`@Observable @MainActor`, fatia auth completa). Plugado em `AppEnvironment.live()` (`authRepository`, `appPreferences`, `securePasswordStore`) — o `BackgroundCheckOrchestrator` já aceita essas peças reais via seam, mas segue não instanciado no `AppEnvironment` (falta `accidentRepository` + `notifications`).
+
+**Atualização física, 21/07/2026:** `.live()` passou a usar `KeychainSecurePasswordStore` e
+`KeychainSessionCookieStore`, ambos com `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. Três testes de
+round-trip/reabertura/clear elevam a suíte unitária para 505 testes. Os backends em memória permanecem apenas
+para previews e testes existentes.
 
 **Revisão adversarial (16 agentes, 2 rodadas — 1ª parcial por limite de sessão, retry completou): 10 CONFIRMED, 0 refutados.**
 - ✅ `onRegEmailChanged` não aplicava `autofillPetrobrasEmailDomain` (helper existia, não era chamado).

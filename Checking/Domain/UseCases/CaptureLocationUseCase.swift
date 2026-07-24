@@ -20,6 +20,39 @@ protocol LocationCapturing: Sendable {
     func callAsFunction(_ accuracyThresholdMeters: Int) async -> LocationCaptureResult
 }
 
+/// Compartilha uma captura que já esteja em andamento para o mesmo limite de precisão. No retorno ao
+/// foreground, UI e orquestrador podem pedir a posição quase simultaneamente; sem esta camada o aparelho
+/// liga o GPS duas vezes e grava duas linhas LOCATION idênticas.
+actor CoalescingLocationCapture: LocationCapturing {
+    private struct InFlight {
+        let id: UUID
+        let task: Task<LocationCaptureResult, Never>
+    }
+
+    private let base: any LocationCapturing
+    private var inFlightByAccuracy: [Int: InFlight] = [:]
+
+    init(base: any LocationCapturing) {
+        self.base = base
+    }
+
+    func callAsFunction(_ accuracyThresholdMeters: Int) async -> LocationCaptureResult {
+        if let existing = inFlightByAccuracy[accuracyThresholdMeters] {
+            return await existing.task.value
+        }
+
+        let id = UUID()
+        let base = self.base
+        let task = Task { await base(accuracyThresholdMeters) }
+        inFlightByAccuracy[accuracyThresholdMeters] = InFlight(id: id, task: task)
+        let result = await task.value
+        if inFlightByAccuracy[accuracyThresholdMeters]?.id == id {
+            inFlightByAccuracy[accuracyThresholdMeters] = nil
+        }
+        return result
+    }
+}
+
 /// Captura GPS → match no servidor → log. Único chokepoint (manual + automático), então a linha de
 /// LOCATION nunca é duplicada. Port de CaptureLocationUseCase.kt.
 struct CaptureLocationUseCase: LocationCapturing {

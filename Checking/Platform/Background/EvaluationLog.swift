@@ -2,11 +2,12 @@ import Foundation
 
 /// Gatilho da avaliação — port de `OrchestratorTrigger`. `name` = enum `.name` do Kotlin.
 enum OrchestratorTrigger: Sendable, Equatable {
-    case timer, geofence, foreground
+    case timer, geofence, significantLocation, foreground
     var name: String {
         switch self {
         case .timer: return "TIMER"
         case .geofence: return "GEOFENCE"
+        case .significantLocation: return "SIGNIFICANT_LOCATION"
         case .foreground: return "FOREGROUND"
         }
     }

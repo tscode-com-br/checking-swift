@@ -1,0 +1,4 @@
+"NSLocationWhenInUseUsageDescription" = "Checking menggunakan lokasi anda untuk melakukan daftar masuk dan daftar keluar automatik semasa anda menggunakan aplikasi.";
+"NSLocationAlwaysAndWhenInUseUsageDescription" = "Untuk melakukan daftar masuk dan daftar keluar secara automatik di latar belakang apabila anda memasuki atau meninggalkan tempat kerja berdaftar, Checking memerlukan akses lokasi Sentiasa.";
+"NSCameraUsageDescription" = "Checking menggunakan kamera hanya apabila anda memilih untuk merakam video kemalangan.";
+"NSMicrophoneUsageDescription" = "Checking menggunakan mikrofon hanya untuk merakam audio video kemalangan yang anda pilih untuk rakam.";

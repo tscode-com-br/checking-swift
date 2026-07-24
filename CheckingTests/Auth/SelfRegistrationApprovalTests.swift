@@ -200,4 +200,32 @@ final class SelfRegistrationApprovalTests: XCTestCase {
         XCTAssertEqual(vm.uiState.selfRegistrationFields.projectCatalog.count, 1)   // inalterado — guard funcionou
         h.teardown()
     }
+
+    func test_explicitDialogActionsExposeSettingsPasswordAndPrefilledRegistration() async {
+        let h = VMHarness()
+        let vm = h.build()
+        await settle { !vm.uiState.isInitializing }
+        vm.onChaveChanged("AB12")
+
+        vm.openSettings()
+        XCTAssertEqual(vm.uiState.dialogOpen, .settings)
+        vm.openPasswordChangeDialog()
+        XCTAssertEqual(vm.uiState.dialogOpen, .passwordChange)
+
+        vm.onPasswordChangeOldPwChanged("old")
+        vm.onPasswordChangeNewPwChanged("new123")
+        vm.onPasswordChangeConfirmPwChanged("new123")
+        XCTAssertEqual(vm.uiState.passwordChangeFields.oldPw, "old")
+        XCTAssertEqual(vm.uiState.passwordChangeFields.newPw, "new123")
+        XCTAssertEqual(vm.uiState.passwordChangeFields.confirmPw, "new123")
+
+        vm.openSelfRegistrationDialog()
+        XCTAssertEqual(vm.uiState.dialogOpen, .selfRegistration)
+        XCTAssertEqual(vm.uiState.selfRegistrationFields.chave, "AB12")
+        XCTAssertEqual(vm.uiState.dismissedAssistanceForChave, "")
+
+        vm.onChaveChanged("")
+        await settle { vm.uiState.chave.isEmpty }
+        h.teardown()
+    }
 }

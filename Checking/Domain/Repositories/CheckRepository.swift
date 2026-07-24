@@ -8,6 +8,7 @@ protocol CheckRepository: Sendable {
     func getHistory(_ chave: String) async -> AppResult<[CheckHistoryEntry]>
     func getLocations() async -> AppResult<LocationOptions>
     func getGeofences(_ chave: String) async -> AppResult<[GeofenceCircle]>
+    func invalidateGeofenceCache()
     func submit(
         chave: String,
         projeto: String,
@@ -21,6 +22,9 @@ protocol CheckRepository: Sendable {
 }
 
 extension CheckRepository {
+    /// Fakes e implementações sem cache não precisam fazer nada.
+    func invalidateGeofenceCache() {}
+
     // fill_forms só é significativo quando false; live/recentes usam true (o servidor assume true).
     func submit(chave: String, projeto: String, action: CheckAction, local: String?,
                 informe: InformeType, eventTime: Date, clientEventId: String) async -> AppResult<HistoryState> {

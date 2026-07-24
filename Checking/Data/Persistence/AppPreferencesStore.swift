@@ -35,6 +35,16 @@ final class UserDefaultsPreferencesStore: AppPreferencesStore, @unchecked Sendab
     func backgroundLocationConsentAt() async -> String { string("pref_bg_location_consent_at") }
     func setBackgroundLocationConsentAt(_ iso8601: String) async { defaults.set(iso8601, forKey: "pref_bg_location_consent_at") }
 
+    /// Snapshot síncrono usado somente durante a composição inicial, antes dos callbacks pendentes do Core
+    /// Location. Mantém as chaves de UserDefaults encapsuladas nesta implementação.
+    func shouldStartSignificantLocationMonitoringAtLaunch() -> Bool {
+        SignificantLocationStartupPolicy.shouldStart(
+            chave: string("pref_chave"),
+            userSettingsJSON: string("pref_user_settings_json"),
+            consentAt: string("pref_bg_location_consent_at")
+        )
+    }
+
     func seenAccidentIds() async -> Set<Int> {
         Set(string("pref_seen_accident_ids").split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
     }

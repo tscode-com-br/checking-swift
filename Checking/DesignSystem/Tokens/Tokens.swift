@@ -5,6 +5,7 @@ import CoreGraphics
 enum Tokens {
     // Layout
     static let headerHeight: CGFloat = 64
+    static let mainHeaderHeight: CGFloat = 48
     static let cardMaxWidth: CGFloat = 680
     static let cardRadius: CGFloat = 16
     static let cardRadiusLarge: CGFloat = 22

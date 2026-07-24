@@ -146,7 +146,7 @@ Fonte única dos fatos legais (resolve os `{token}` da spec de i18n §11): contr
 - [ ] Descrições inglês **byte-exatas**; `logQueuedOffline` grava **kind=SYNC**; `locText` fallback "an unknown location" (mas grava o valor cru).
 - [ ] Store isolado (Core Data próprio), não misturar no modelo principal.
 - [ ] `AppPreferences` chaves/defaults idênticos; `seenAccidentIds` tolerante; `pref_flag_`; `clearAll`.
-- [ ] 3 stores cifrados → Keychain/CryptoKit `ThisDeviceOnly`; fila offline com `clear()` (D6).
+- [~] Senhas + cookies no Keychain `ThisDeviceOnly`; fila offline cifrada/durável e `clear()` (D6) ainda pendentes.
 - [ ] `Clock` injetável (Singapore p/ dia; aparelho p/ pausa); `PrivacyConfig` preenchido antes de publicar.
 - [ ] 21 testes portados e verdes (8 integração Core Data + 13 unit).
 

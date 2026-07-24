@@ -29,8 +29,7 @@ final class CoreDataActivityLogDao: ActivityLogDao, @unchecked Sendable {
     }
 
     func insert(_ row: ActivityLogRow) throws {
-        var thrown: Error?
-        context.performAndWait {
+        try context.performAndWait {
             let object = NSEntityDescription.insertNewObject(forEntityName: ActivityLogModel.entityName, into: context)
             object.setValue(nextSeq(), forKey: "seq")
             object.setValue(row.atEpochMs, forKey: "atEpochMs")
@@ -39,9 +38,8 @@ final class CoreDataActivityLogDao: ActivityLogDao, @unchecked Sendable {
             object.setValue(row.severity, forKey: "severity")
             object.setValue(row.description, forKey: "desc")
             object.setValue(row.location, forKey: "location")
-            do { try context.save() } catch { thrown = error }
+            try context.save()
         }
-        if let thrown { throw thrown }
     }
 
     func deleteOlderThan(_ epochMs: Int64) {
@@ -62,13 +60,12 @@ final class CoreDataActivityLogDao: ActivityLogDao, @unchecked Sendable {
     }
 
     func pageNewestFirst(limit: Int, offset: Int) -> [ActivityLogRow] {
-        var result: [ActivityLogRow] = []
         context.performAndWait {
             let request = NSFetchRequest<NSManagedObject>(entityName: ActivityLogModel.entityName)
             request.sortDescriptors = Self.newestFirst
             request.fetchLimit = limit
             request.fetchOffset = offset
-            result = ((try? context.fetch(request)) ?? []).map { object in
+            return ((try? context.fetch(request)) ?? []).map { object in
                 ActivityLogRow(
                     id: ((object.value(forKey: "seq") as? NSNumber)?.int64Value) ?? 0,
                     atEpochMs: ((object.value(forKey: "atEpochMs") as? NSNumber)?.int64Value) ?? 0,
@@ -79,16 +76,13 @@ final class CoreDataActivityLogDao: ActivityLogDao, @unchecked Sendable {
                     location: object.value(forKey: "location") as? String)
             }
         }
-        return result
     }
 
     func count() -> Int {
-        var result = 0
         context.performAndWait {
             let request = NSFetchRequest<NSManagedObject>(entityName: ActivityLogModel.entityName)
-            result = (try? context.count(for: request)) ?? 0
+            return (try? context.count(for: request)) ?? 0
         }
-        return result
     }
 
     func clearAll() {

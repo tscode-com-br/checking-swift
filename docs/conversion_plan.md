@@ -1222,6 +1222,56 @@ Gate: builds reprodutíveis em CI e aparelho real, sem segredos no repositório.
 
 Esta fase ocorre cedo para reduzir o maior risco.
 
+> **Execução em 21/07/2026:** a prova reproduzível no iOS Simulator aprovou atualização contínua de
+> localização em background e geofences ENTER/EXIT. BackgroundTasks e push silencioso permaneceram
+> inconclusivos por limitações do Simulator. A fase não está concluída até o gate em aparelho físico.
+> Evidências e comando: [`background_validation_simulator.md`](background_validation_simulator.md).
+>
+> **Execução física iniciada em 21/07/2026:** smoke em iPhone 14 Pro/iOS 26.5.2 aprovou login pela UI,
+> Keychain, 9 geofences registradas, token APNs sandbox e callbacks contínuos com o app em background e a
+> tela bloqueada. A avaliação parcial aprovou a entrega em background de ENTER/EXIT de regiões reais, mas
+> detectou um crash no callback de `BGAppRefresh`, perda do relatório anterior após relançamento e atividades
+> automáticas desligadas. O primeiro ensaio prolongado foi encerrado como diagnóstico; deve ser reiniciado
+> após as correções. Os handlers agora usam fila explícita compatível com Swift 6, o relatório continua entre
+> processos, o perfil físico usa geofence + mudanças significativas sem GPS contínuo e a UI exige atividades
+> automáticas/projeto válidos. Build corrigido instalado; aguardando o segundo ensaio. Reboot, degradação, push
+> e o gate de 24 horas seguem abertos. Evidências:
+> [`background_validation_physical.md`](background_validation_physical.md).
+>
+> **Segundo smoke físico aprovado em 21/07/2026:** quatro ciclos reais de `BGAppRefresh` concluíram sem crash;
+> geofences/timer realizaram quatro check-ins coerentes durante deslocamento, com notificações inclusive sob
+> tela bloqueada, e a bateria permaneceu em 100% na janela móvel de 24 minutos. ENTERs redundantes do Core
+> Location foram deduplicados antes do build de 24 horas. Ressalva: o backend ainda rejeita a mudança para
+> `Localização não Cadastrada` quando `X-Client=checking-ios`, embora o motor tenha paridade com o Kotlin.
+> O produto confirmou que essa tentativa é obrigatória: não remover nem silenciar o ramo no iOS; homologar o
+> cliente iOS no backend com a mesma exceção concedida ao Android.
+>
+> **Primeiro ensaio prolongado reprovado em 22/07/2026:** o iOS preservou as regiões, relançou o processo três
+> vezes e entregou EXIT/ENTER ao coletor, mas o delegate de produção era criado apenas no primeiro `sync` e
+> perdeu o evento pendente após relançamento frio. Resultado: sem triggers de geofence nem atividades. O manager
+> de produção agora é criado imediatamente na composição do app; 514 testes passaram e o build corrigido foi
+> instalado. O consumo estacionário observado (~6,3 pontos percentuais/h, bateria com 75% de saúde) requer
+> atribuição pela tela de Bateria e nova amostra controlada.
+>
+> **Ensaio dirigido de relançamento frio em 22/07/2026:** após encerrar o processo por `SIGTERM` sem force-quit,
+> o iOS relançou o app em background na saída do Escritório Principal e o delegate corrigido registrou EXIT de
+> duas regiões, `production_geofence_exit` e avaliação GEOFENCE. A causa raiz anterior está, portanto, corrigida.
+> Não houve crash. Durante as chegadas ao Escritório Avançado e à Unidade P80, porém, o Core Location não
+> entregou ENTER; o harness recebeu mudanças significativas às 08:20 e 08:27, mas elas não acionaram o negócio.
+> Auditoria confirmou que `startMonitoringSignificantLocationChanges` ainda existe apenas no harness Debug,
+> embora a Camada B deste plano determine seu uso em produção. O check-in do P80 ocorreu somente quando um
+> `BGAppRefresh` discricionário executou às 09:06; no Principal, o ENTER gerou check-in imediato às 09:14.
+> Próxima correção obrigatória antes de novo ensaio prolongado: monitor de mudanças significativas de produção,
+> restauração fria e encaminhamento single-flight ao orquestrador, com gatilho distinguível nos diagnósticos.
+>
+> **Correção da Camada B instalada em 22/07/2026:** o novo monitor de produção nasce cedo, restaura apenas com
+> chave/consentimento/automático/projeto elegíveis e encaminha callbacks como `SIGNIFICANT_LOCATION` ao mesmo
+> orquestrador. Troca de conta, desativação e exclusão interrompem o serviço. Sete testes direcionados e a suíte
+> completa de 519 testes passaram. O build físico assinado foi instalado preservando os dados. No smoke real
+> das 09:36:48, o iPhone registrou `production_significant_location`, executou
+> `Background evaluation (SIGNIFICANT_LOCATION)`, obteve match do local atual e concluiu a matriz sem ação
+> duplicada. Resta repetir o percurso com o app suspenso ou relançado e aferir latência/energia.
+
 Entregas:
 
 - app mínimo com escada de permissão;
@@ -1266,6 +1316,46 @@ Gate: login, sessão expirada, offline/replay e limpeza total aprovados em stagi
 
 ### Fase 5 — shell visual, autenticação e tela principal
 
+> **Sub-slice UI-3 executada em 22/07/2026:** a tela definitiva passou a usar o estado e o `CheckViewModel`
+> reais após o splash. Foram ligados histórico, avisos, chave/senha/engrenagem, cadastro assistido e troca de
+> senha em overlays, preservando a ordem do Android e o acesso `DEBUG` à validação física. Build e inspeção
+> visual no iPhone 17 Simulator aprovados; 525 testes unitários e o smoke de UI da árvore inicial passaram.
+> A Fase 5 permanece aberta: faltam a tela autenticada completa, ajustes completos, os cinco idiomas adicionais
+> e a revisão lado a lado/snapshots nos aparelhos-alvo. A build não foi instalada no iPhone físico para não
+> invalidar o ensaio de background em andamento. Detalhes: [`port_spec_ui_design_system.md`](port_spec_ui_design_system.md#18-implementação--tela-inicial-e-autenticação-sub-slice-ui-3-2026-07-22).
+>
+> **Sub-slice UI-4 executada em 22/07/2026:** a área autenticada agora carrega projetos, catálogo, locais e
+> permissões reais; exibe registro Check-In/Check-Out, informe Normal/Retroativo, associação de projetos,
+> fallback de local manual e botão de submissão. O envio preserva UUID/timestamp no fallback offline, trata
+> expiração de sessão, reconcilia histórico e persiste o projeto ativo para o motor em background. A troca de
+> chave também passou a restaurar preferências isoladas por conta. Build/inspeção no iPhone 17 Simulator,
+> smoke de UI autenticado e **533 testes unitários** aprovados. A build arm64 assinada para o iPhone conectado
+> está pronta, mas não foi instalada para preservar o ensaio atual. Transporte, acidente, nudge/ajustes
+> completos e snapshots lado a lado continuam pendentes. Detalhes:
+> [`port_spec_ui_design_system.md`](port_spec_ui_design_system.md#19-implementação--registro-manual-localização-e-projetos-sub-slice-ui-4-2026-07-22).
+>
+> **Sub-slice UI-5 executada em 22/07/2026:** foram integrados nudge por chave, Ajustes agrupados, painel vivo
+> de Atividades Automáticas/consentimento/permissões, Pausa Programada, preferências de avisos, confirmação
+> destrutiva de remoção e histórico expandido filtrado. Escritas concorrentes de preferências são serializadas
+> e preservam projetos; o toggle controla o monitor significativo e reavalia o motor. A suíte aprovou **538
+> testes unitários e 6 testes de UI**; a navegação interna dos Ajustes teve um defeito de toque descoberto pelo
+> smoke e corrigido antes do build físico. Transporte, acidente e conteúdo/idiomas permanecem fora do candidato.
+> Detalhes: [`port_spec_ui_design_system.md`](port_spec_ui_design_system.md#20-implementação--ajustes-operacionais-e-histórico-expandido-sub-slice-ui-5-2026-07-22).
+>
+> **Sub-slice UI-6 executada em 22/07/2026:** o log de Atividades do Android foi ligado ao store Core Data
+> real nos Ajustes, com snapshot, paginação newest-first de 30, agrupamento por dia, cores de severidade,
+> carregamento incremental e limpeza protegida contra leituras concorrentes. O conteúdo permanece em inglês
+> por especificação do Android. Evidência: **539 testes unitários + 9 testes de UI**, captura e build físico
+> instalado. Idiomas e demais conteúdos continuam pendentes.
+>
+> **Sub-slice UI-7 executada em 22/07/2026:** o grupo Ajuda foi completado com Instruções de Uso, Suporte,
+> Sobre e Privacidade. A rota de instruções foi adaptada ao fluxo efetivo do iPhone, com oito capítulos e oito
+> capturas nativas reproduzíveis do simulador, sem dados pessoais. Sobre inclui a história e as matrizes
+> Web/Nativo; Suporte abre WhatsApp com chave predefinida; Privacidade
+> inclui as dez seções LGPD, e-mail/política e wipe local completo, separado da exclusão remota. Navegação
+> preserva o `CheckViewModel`. Evidência: **543 testes unitários + 12 testes de UI**, build e inspeção no simulador; detalhes em
+> [`port_spec_ui_design_system.md`](port_spec_ui_design_system.md#22-implementação--conteúdo-suporte-e-privacidade-sub-slice-ui-7-2026-07-22).
+
 Entregas:
 
 - splash;
@@ -1278,6 +1368,11 @@ Entregas:
 Gate: revisão visual lado a lado nos aparelhos-alvo e fluxos de autenticação aprovados.
 
 ### Fase 6 — check manual, histórico e projetos
+
+> **Execução parcial em 22/07/2026:** o núcleo de check manual normal/retroativo, seleção de projeto/local,
+> idempotência, fila offline, mensagens e atualização do histórico foi integrado na UI-4. O gate permanece
+> aberto até os roteiros reais de sucesso/erro/offline no iPhone e comparação Android. O histórico expandido
+> foi concluído na UI-5 com estados loading/vazio/erro/retry.
 
 Entregas:
 
@@ -1308,6 +1403,11 @@ Gate: matriz real de background aprovada e orçamento de energia atendido.
 
 ### Fase 8 — transporte
 
+> **Decisão de escopo em 22/07/2026:** Transporte foi adiado por decisão do produto e não integra o primeiro
+> candidato iOS nem o programa inicial de testes. A interface não deve oferecer controles de Transporte
+> inoperantes, mesmo quando a API indicar `transportEnabled`; o domínio e as especificações existentes serão
+> preservados para uma etapa posterior. As Fases 9 a 12 prosseguem normalmente, sem depender desta fase.
+
 Entregas:
 
 - todos os tipos e estados de solicitação;
@@ -1319,6 +1419,15 @@ Gate: testes de estado concorrente e roteiro completo aprovados.
 
 ### Fase 9 — acidente e vídeo
 
+> **Execução funcional em 22/07/2026:** o estado/contrato de Acidentes existente foi conectado à tela
+> principal com banner, consulta de zona, confirmações, ciência, ações, emergência e wizard de cinco passos.
+> A captura agora é AVFoundation real (traseira + microfone, MP4 HD e preview), aguarda a finalização do
+> contêiner e envia por background URLSession restaurável a partir de arquivo protegido. Falhas mantêm a
+> gravação, oferecem retry e reutilizam a idempotency key; sucesso só é exibido após HTTP e JSON válidos.
+> Notificações locais/APNs possuem categoria, ação de abertura, reconhecimento de payload e reconciliação.
+> Build e testes direcionados estão verdes, incluindo dois roteiros de UI. Permanecem para o gate: endpoint
+> backend de device token APNs, ensaio seguro em staging/iPhone, capturas finais e capítulo 5 do manual.
+
 Entregas:
 
 - wizard e tema;
@@ -1328,10 +1437,77 @@ Entregas:
 - emergência via backend;
 - gravação e upload em background;
 - tratamento real de sucesso/erro.
+- concluir o capítulo `5. Reportar Acidente` das Instruções de Uso somente depois da implementação e da
+  homologação, cobrindo: abertura do fluxo, situação e zona de segurança, vídeo e upload, notificações, chamada
+  de emergência, estados de erro/sucesso, encerramento e advertências operacionais; produzir capturas nativas
+  com doubles seguros, sem disparar um acidente ou serviço real durante a documentação.
 
 Gate: ensaio ponta a ponta em ambiente seguro, sem acionar serviço real indevidamente.
 
 ### Fase 10 — conteúdo, privacidade e acessibilidade
+
+> **Execução parcial em 22/07/2026 (UI-7):** manual, Sobre, Suporte e a superfície LGPD em português estão
+> implementados e integrados, incluindo os canais externos e a limpeza local testada. Permanecem abertos os
+> cinco idiomas adicionais, auditoria completa de acessibilidade/contraste/Reduce Motion, rótulos finais de
+> privacidade e revisão jurídica/editorial para publicação. A revisão deve também confirmar no backend a regra
+> informada de 45 dias sem atividade para desligamento de projetos e a deduplicação diária do FORMS; defaults de
+> DTO não serão tratados como regra de negócio.
+>
+> **Auditoria de Privacy Manifest em 22/07/2026:** além de localização precisa, identificador e conteúdo
+> livre, o manifesto passou a declarar explicitamente nome, e-mail, fotos/vídeos e áudio, todos vinculados ao
+> usuário, apenas para funcionalidade e sem tracking. O plist foi validado. A mesma matriz deverá ser
+> reproduzida no App Store Connect e revisada pelo responsável jurídico antes da publicação.
+>
+> **Internacionalização estrutural e acessibilidade em 22/07/2026:** os seis dicionários canônicos do Kotlin
+> foram convertidos para catálogos Swift planos por um gerador reproduzível (3.158 traduções), com resolução
+> de variantes/aliases, detecção do idioma preferido do iPhone, fallback por chave para português e tradução
+> de mensagens conhecidas da API. Ajustes agora oferece um seletor persistente para português, inglês, chinês,
+> malaio, indonésio e tagalog/filipino; a troca para inglês foi validada por UI test. As quatro mensagens de
+> permissão do sistema possuem `InfoPlist.strings` nos seis idiomas e foram verificadas dentro do bundle.
+> A tipografia passou a usar estilos semânticos com Dynamic Type; histórico, escolhas, seletores e botões se
+> reorganizam/crescem sem alturas rígidas. A auditoria XCTest aprovou detecção de elementos, regiões de toque,
+> descrições, Dynamic Type, corte de texto e traits. Os pares de cor foram aprovados por cálculo WCAG AA; o
+> teste de contraste visual do XCTest foi substituído por esse cálculo porque gera falsos positivos nos glows
+> translúcidos do SwiftUI. Permanecem abertos: traduzir/revisar os textos exclusivos do iOS que hoje usam
+> fallback português (principalmente o manual novo, privacidade e adições de Acidente), VoiceOver manual e
+> revisão humana dos seis idiomas. Reduce Motion já elimina o desenho/fade do splash e reduz sua espera, mas
+> ainda será confirmado no roteiro assistivo em aparelho.
+>
+> **Fechamento editorial do inglês em 22/07/2026:** os textos exclusivos do iPhone receberam uma camada
+> editorial inglesa completa, incluindo o novo manual ilustrado, permissões operacionais, Suporte e todas as
+> adições funcionais de Acidentes. A cobertura deixou de depender do fallback português para as 455 chaves
+> editoriais nativas do iOS. Testes automatizados agora falham se uma nova chave portuguesa não possuir versão
+> inglesa própria ou se os tokens de interpolação divergirem; um roteiro de UI abre diretamente o manual em
+> inglês e valida título, introdução, capítulos e navegação. Chinês, malaio, indonésio e tagalog/filipino
+> continuam com os catálogos canônicos do Android e fallback seguro para o conteúdo exclusivo do iPhone;
+> esses quatro idiomas só serão declarados completos após tradução editorial e revisão humana, especialmente
+> dos textos jurídicos, de privacidade e segurança. Evidência do bloco: **560 testes unitários e 18 testes de
+> UI aprovados**, sem falhas.
+>
+> **Catálogos editoriais adicionais em 22/07/2026:** as 288 chaves específicas do iPhone que ainda não
+> existiam em cada catálogo Android receberam versões preliminares em chinês simplificado, malaio, indonésio
+> e tagalog/filipino, totalizando **1.152 traduções novas**. O artefato Swift é estático e o aplicativo não usa
+> tradução online em tempo de execução. Marcas e tokens de interpolação são protegidos durante a geração;
+> testes exigem cobertura nativa das 455 chaves editoriais em cada um dos seis idiomas, igualdade dos tokens e
+> ausência de marcadores internos. Um roteiro de UI abre o manual nos quatro idiomas e valida título,
+> introdução e navegação. Esta entrega elimina o fallback português nas superfícies editoriais, mas **não
+> encerra a revisão linguística**: as traduções geradas são rascunhos de engenharia e os textos de LGPD,
+> consentimento, privacidade, emergência e segurança precisam de revisão por pessoas fluentes e pelo
+> responsável jurídico antes da publicação. Evidência do bloco: **561 testes unitários e 19 testes de UI
+> aprovados**, sem falhas.
+>
+> **Hardening assistivo em 22/07/2026:** a árvore de acessibilidade passou a isolar conteúdo sob diálogos,
+> usar botões semânticos reais em Ajustes, anunciar seleção e valores de projetos/locais/permissões, publicar
+> avisos operacionais e de Acidente ao VoiceOver, agrupar bullets/anotações e expor títulos no rotor de
+> cabeçalhos. Chave, senha, cabeçalhos, permissões, horários, histórico e ações de Acidente receberam layouts
+> adaptativos; no tamanho máximo `Accessibility 5`, o histórico vira uma lista vertical rotulada e os controles
+> que competiam horizontalmente são empilhados. O splash usa fontes escaláveis e uma política testável que
+> remove animação e espera longa com Reduce Motion. As auditorias estruturais passaram na tela principal em
+> tamanho normal e, no tamanho máximo, em tela principal, Ajustes, manual, Atividades Automáticas, histórico e
+> wizard de Acidentes. Evidência: **562 testes unitários e 26 testes de UI aprovados**, sem falhas. O gate ainda
+> exige a execução humana no iPhone do roteiro
+> [`accessibility_validation.md`](accessibility_validation.md), pois automação não comprova pronúncia, conforto
+> auditivo, gestos reais nem retorno subjetivamente lógico do foco.
 
 Entregas:
 
@@ -1359,6 +1535,11 @@ Entregas:
 Gate: Definition of Done integral atendida.
 
 ### Fase 12 — TestFlight, App Review e rollout
+
+> O primeiro piloto será iniciado somente após a conclusão e o hardening das demais funcionalidades deste
+> ciclo. Seu escopo funcional excluirá Transporte de forma explícita nas notas do build e nos roteiros de
+> teste. Testes automatizados, inspeções técnicas e builds em aparelhos continuam obrigatórios durante o
+> desenvolvimento; apenas o programa de testes com usuários fica postergado.
 
 Entregas:
 

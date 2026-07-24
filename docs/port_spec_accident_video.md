@@ -202,8 +202,12 @@ Não são decisões registradas; **replicar** salvo decisão de produto:
 - [x] Wizard 5 passos + `effective*` + descrição ≤500; `open` manda `description=""` nunca null.
 - [x] Fila de ciência (sessão) + dedup persistido do orquestrador; ack não confirma → sem `acknowledge`.
 - [x] Emergência via backend; idempotência por `.conflict` mantida.
-- [~] Vídeo: câmera/mic no momento da gravação; AVFoundation HD traseira+áudio — **seam pronto** (`VideoRecording`), bind real de câmera/preview fica p/ o slice de UI. Upload síncrono via `Data(contentsOf:)` (progresso em 2 ticks 0/1, não byte-a-byte) — upload em background real (`URLSessionConfiguration.background` + delegate, plano §19.3) **adiado**. Nunca mostra sucesso sem confirmação real (D4) — isso está feito.
-- [ ] Tema vermelho environment-driven; alerta em background por APNs (dependência de backend). **Adiado** (slices de UI/design-system e backend).
+- [x] Vídeo: câmera/mic solicitados em contexto; captura AVFoundation real HD 1280×720, câmera traseira,
+  áudio, preview e finalização do MP4 aguardada antes do envio. Upload por
+  `URLSessionConfiguration.background`, corpo multipart em arquivo protegido, progresso por bytes,
+  restauração do delegate no relançamento, retenção para retry e idempotency key estável por gravação.
+- [~] Tema/fluxo visual completos; cliente APNs reconhece acidente, reconcilia, categoriza a notificação e
+  abre o app com segurança. **Pendente externo:** endpoint/backend para cadastrar e remover o device token.
 - [x] SSE filtra "accident"; polling 30s só quando `isActive`.
 - [x] Novos XCTests (D1–D4 + inquiryScenario + reconcileAckQueue + wizard) verdes — 81 testes.
 
@@ -220,4 +224,22 @@ Implementado e verde (392 testes; 81 deste slice): `AccidentUiState`+`WizardStat
 - ✅ `VideoRecordController.stopRecordingAndUpload` sem guarda de reentrância (duplo toque disparava upload duplicado).
 - ✅ `MultipartFormBuilder` sem escapar `"`/CRLF nos headers (hardening — nenhum call-site atual é hostil, mas o builder é geral).
 - ↩️ Refutados: 2 achados não confirmados na verificação adversarial.
-- **Adiado, não corrigido** (fiel à fonte ou já documentado como enhancement futuro): progresso de upload em 2 ticks em vez de byte-a-byte (upload real em background é trabalho de plataforma maior, já previsto no plano §19.3); `idempotencyKey` gerado por-chamada, não persistido entre re-tentativas (o Kotlin faz EXATAMENTE isso — `decision_log.md` D4 já marca persistir como "enhancement em aberto a decidir depois", não um bug); `try?` engolindo falha de exclusão do temp (o Kotlin faz `runCatching{delete}` igualmente silencioso — fiel, não um bug).
+- **Enhancements concluídos em 22/07/2026:** o progresso passou a ser medido por bytes na background
+  URLSession e a idempotency key tornou-se estável durante as tentativas da mesma gravação. A limpeza
+  best-effort continua silenciosa, como no Kotlin, mas ocorre apenas após sucesso HTTP com resposta válida.
+
+## 17. Integração de UI, captura e upload restaurável (2026-07-22)
+
+O módulo foi integrado como overlay da tela Check, preservando a navegação e o estado existentes. Foram
+implementados banner, cartão de consulta, confirmações de zona, fila de ciência, ações de emergência, wizard
+de cinco passos, estado visual de acidente, tela de câmera e retry explícito. A captura usa
+`AVCaptureSession`/`AVCaptureMovieFileOutput`; o controlador só envia depois do callback de finalização.
+
+O transporte do vídeo passou a usar uma background `URLSession` com `sessionSendsLaunchEvents`,
+`uploadTask(fromFile:)`, multipart materializado em Application Support com proteção até o primeiro unlock e
+metadados de limpeza em `taskDescription`. HTTP 2xx com JSON inválido não apaga a gravação. O arquivo original
+só é removido após resposta válida; falhas conservam o vídeo e reutilizam a mesma idempotency key no retry.
+
+Validação automatizada desta integração: build sem warnings do código do app, **550 testes unitários** no total,
+11 direcionados de vídeo, 9 de notificações, 5 do orquestrador e 2 fluxos de UI de acidente aprovados. A câmera, o upload real, a chamada
+de emergência e o push do backend ainda exigem ensaio controlado em iPhone/staging antes do gate.

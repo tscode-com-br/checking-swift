@@ -11,13 +11,43 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
 
     // `UNNotificationRequest` não é `Sendable` na SDK — um `actor` aqui exigiria cruzar o limite de
     // isolamento com um tipo não-Sendable. Classe com `NSLock` (mesmo padrão de `FakeProjectsApi`).
-    private final class SpyCenter: NotificationRequestPosting, @unchecked Sendable {
+    private final class SpyCenter: ScheduledNotificationCenter, @unchecked Sendable {
         private let lock = NSLock()
-        private var recorded: [(identifier: String, title: String, body: String)] = []
-        var requests: [(identifier: String, title: String, body: String)] { lock.withLock { recorded } }
+        private var recorded: [(
+            identifier: String,
+            title: String,
+            body: String,
+            category: String,
+            event: String?,
+            nextTriggerDate: Date?
+        )] = []
+        private var removedIdentifiers: [[String]] = []
+        var requests: [(
+            identifier: String,
+            title: String,
+            body: String,
+            category: String,
+            event: String?,
+            nextTriggerDate: Date?
+        )] {
+            lock.withLock { recorded }
+        }
+        var removals: [[String]] { lock.withLock { removedIdentifiers } }
 
         func add(_ request: UNNotificationRequest) async throws {
-            lock.withLock { recorded.append((request.identifier, request.content.title, request.content.body)) }
+            lock.withLock {
+                recorded.append((
+                    request.identifier,
+                    request.content.title,
+                    request.content.body,
+                    request.content.categoryIdentifier,
+                    request.content.userInfo["checking_event"] as? String,
+                    (request.trigger as? UNCalendarNotificationTrigger)?.nextTriggerDate()))
+            }
+        }
+
+        func removePendingNotificationRequests(withIdentifiers identifiers: [String]) {
+            lock.withLock { removedIdentifiers.append(identifiers) }
         }
     }
 
@@ -28,7 +58,18 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
 
     // O post é fire-and-forget (`Task { ... }`, sem suspensão no protocolo — fiel ao `notify()` síncrono
     // do Android). Poll curto com timeout — mesma estratégia de `awaitActive` no teste instrumentado Kotlin.
-    private func awaitRequests(_ spy: SpyCenter, count: Int = 1, timeout: TimeInterval = 1.0) async -> [(identifier: String, title: String, body: String)] {
+    private func awaitRequests(
+        _ spy: SpyCenter,
+        count: Int = 1,
+        timeout: TimeInterval = 1.0
+    ) async -> [(
+        identifier: String,
+        title: String,
+        body: String,
+        category: String,
+        event: String?,
+        nextTriggerDate: Date?
+    )] {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             let current = spy.requests
@@ -45,6 +86,8 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests.first?.title, "Checking")
         XCTAssertEqual(requests.first?.body, "Checking: acidente reportado!")
+        XCTAssertEqual(requests.first?.category, AppDelegate.accidentNotificationCategory)
+        XCTAssertEqual(requests.first?.event, "accident")
     }
 
     func test_postActivityNotification_checkIn_postsCheckinMessage() async {
@@ -52,15 +95,29 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
         sut.postActivityNotification(action: .checkIn, local: "Unidade P80", lang: "pt")
         let requests = await awaitRequests(spy)
         XCTAssertEqual(requests.first?.title, "Checking")
-        XCTAssertEqual(requests.first?.body, "Check-In realizado.")
+        XCTAssertEqual(requests.first?.body, "Check-In @ Unidade P80")
     }
 
-    func test_postActivityNotification_checkOut_postsCheckoutMessage() async {
+    func test_postActivityNotification_checkOut_postsLocation() async {
         let (sut, spy) = makeSUT()
-        sut.postActivityNotification(action: .checkOut, local: nil, lang: "pt")
+        sut.postActivityNotification(action: .checkOut, local: "Zona Mista", lang: "pt")
         let requests = await awaitRequests(spy)
         XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.body, "Check-Out @ Zona Mista")
+    }
+
+    func test_postActivityNotification_withoutLocation_keepsGenericMessage() async {
+        let (sut, spy) = makeSUT()
+        sut.postActivityNotification(action: .checkOut, local: "  ", lang: "pt")
+        let requests = await awaitRequests(spy)
         XCTAssertEqual(requests.first?.body, "Check-Out realizado.")
+    }
+
+    func test_postActivityNotification_localizesActionLabel() async {
+        let (sut, spy) = makeSUT()
+        sut.postActivityNotification(action: .checkIn, local: "办公区", lang: "zh")
+        let requests = await awaitRequests(spy)
+        XCTAssertEqual(requests.first?.body, "签到 @ 办公区")
     }
 
     func test_postScheduledPauseTransition_started_postsPauseStartMessage() async {
@@ -106,5 +163,56 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
         let requests = await awaitRequests(spy, count: 2)
         XCTAssertEqual(requests.count, 2)
         XCTAssertNotEqual(requests[0].identifier, requests[1].identifier)
+    }
+
+    func test_pauseScheduler_postsTimedStart_andConsumesItAfterDueTime() async {
+        let spy = SpyCenter()
+        let suite = "br.com.tscode.checking.tests.pause.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let sut = LocalNotificationPauseAlarmScheduler(center: spy, defaults: defaults)
+        let fireDate = Date().addingTimeInterval(120)
+
+        await sut.scheduleStart(at: fireDate, notify: true, lang: "pt")
+
+        XCTAssertEqual(spy.requests.count, 1)
+        XCTAssertEqual(spy.requests.first?.body, "Checking em pausa.")
+        XCTAssertEqual(spy.requests.first?.event, "scheduled_pause_started")
+        XCTAssertNotNil(spy.requests.first?.nextTriggerDate)
+        let beforeDue = await sut.consumeScheduledTransition(
+            started: true,
+            dueAtOrBefore: fireDate.addingTimeInterval(-1))
+        let atDue = await sut.consumeScheduledTransition(
+            started: true,
+            dueAtOrBefore: fireDate)
+        let afterConsume = await sut.consumeScheduledTransition(
+            started: true,
+            dueAtOrBefore: fireDate.addingTimeInterval(1))
+        XCTAssertFalse(beforeDue)
+        XCTAssertTrue(atDue)
+        XCTAssertFalse(afterConsume)
+    }
+
+    func test_pauseScheduler_cancelledOrDisabled_doesNotLeaveRequest() async {
+        let spy = SpyCenter()
+        let suite = "br.com.tscode.checking.tests.pause.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let sut = LocalNotificationPauseAlarmScheduler(center: spy, defaults: defaults)
+
+        await sut.scheduleResume(at: Date().addingTimeInterval(120), notify: false, lang: "pt")
+
+        XCTAssertTrue(spy.requests.isEmpty)
+        XCTAssertFalse(spy.removals.isEmpty)
+    }
+
+    func test_accidentPushPayloadRecognition_acceptsContractVariants() {
+        XCTAssertTrue(AppDelegate.isAccidentPayload(["checking_event": "accident"]))
+        XCTAssertTrue(AppDelegate.isAccidentPayload(["event": "accident_opened"]))
+        XCTAssertTrue(AppDelegate.isAccidentPayload([
+            "aps": ["category": AppDelegate.accidentNotificationCategory],
+        ]))
+        XCTAssertFalse(AppDelegate.isAccidentPayload(["type": "checkin"]))
+        XCTAssertFalse(AppDelegate.isAccidentPayload(["aps": ["alert": "hello"]]))
     }
 }

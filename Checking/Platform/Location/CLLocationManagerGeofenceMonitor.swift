@@ -8,34 +8,31 @@ import CoreLocation
 /// log) vive em `GeofenceRegionPrioritizer`/`GeofenceRegionManager`, exercitados com um monitor fake.
 ///
 /// `@MainActor`: o `CLLocationManager` entrega callbacks na run loop da thread que o criou; fixar na main
-/// garante uma run loop ativa. O `init` é `nonisolated` (só guarda logger/closure) e o manager é criado
-/// preguiçosamente no 1º `sync`, para poder ser construído a partir da composição não-isolada.
+/// garante uma run loop ativa. O manager e seu delegate são criados IMEDIATAMENTE na composição do app:
+/// regiões persistem no sistema entre processos e o evento que relança o app pode chegar antes de qualquer
+/// `sync`. Criação preguiçosa perde exatamente esse primeiro ENTER/EXIT em background.
 @MainActor
 final class CLLocationManagerGeofenceMonitor: NSObject, GeofenceRegionMonitoring, CLLocationManagerDelegate {
-    private var manager: CLLocationManager?
+    private let manager: CLLocationManager
+    private var transitionDeduplicator = GeofenceTransitionDeduplicator()
     private let activityLogger: any ActivityLogging
     private let onGeofenceWake: @Sendable () -> Void
 
     /// `onGeofenceWake`: acorda o orquestrador (`runOnce(.geofence)`) — injetado p/ evitar acoplar o monitor
     /// ao actor do orquestrador. Port do `orchestrator.runOnce(GEOFENCE)` do BroadcastReceiver.
-    nonisolated init(activityLogger: any ActivityLogging, onGeofenceWake: @escaping @Sendable () -> Void) {
+    init(activityLogger: any ActivityLogging, onGeofenceWake: @escaping @Sendable () -> Void) {
         self.activityLogger = activityLogger
         self.onGeofenceWake = onGeofenceWake
+        manager = CLLocationManager()
         super.init()
+        manager.delegate = self
     }
 
     private func ensureManager() -> CLLocationManager {
-        if let manager { return manager }
-        let mgr = CLLocationManager()
-        mgr.delegate = self
-        // Region monitoring pode entregar em background e RELANÇAR o app terminado sem `allowsBackgroundLocationUpdates`
-        // — MAS, para receber o evento que relançou o app, um `CLLocationManager` com delegate precisa ser criado
-        // cedo no launch. Hoje este monitor é criado só no 1º `sync` (via `register`, ainda sem call-site de
-        // produção); armar o handler de launch é do slice do gatilho (foreground/login). Entrega em background exige
-        // autorização "Always" — pedir a permissão é do slice de permissões, não daqui.
-        manager = mgr
-        return mgr
+        manager
     }
+
+    var isDelegateActiveForTest: Bool { manager.delegate === self }
 
     func sync(_ regions: [GeofenceRegion]) {
         guard CLLocationManager.isMonitoringAvailable(for: CLCircularRegion.self) else {
@@ -87,11 +84,13 @@ final class CLLocationManagerGeofenceMonitor: NSObject, GeofenceRegionMonitoring
     // MARK: - CLLocationManagerDelegate (callbacks nonisolated → hop p/ MainActor)
 
     nonisolated func locationManager(_ manager: CLLocationManager, didEnterRegion region: CLRegion) {
-        Task { @MainActor [weak self] in self?.handleTransition(entered: true) }
+        let identifier = region.identifier
+        Task { @MainActor [weak self] in self?.handleTransition(entered: true, identifier: identifier) }
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
-        Task { @MainActor [weak self] in self?.handleTransition(entered: false) }
+        let identifier = region.identifier
+        Task { @MainActor [weak self] in self?.handleTransition(entered: false, identifier: identifier) }
     }
 
     // INITIAL_TRIGGER_ENTER (parte 1): só depois de a região estar CONFIRMADA (este callback) pedimos o
@@ -104,7 +103,8 @@ final class CLLocationManagerGeofenceMonitor: NSObject, GeofenceRegionMonitoring
     // (o Android entrega esse ENTER inicial via GeofencingRequest.INITIAL_TRIGGER_ENTER).
     nonisolated func locationManager(_ manager: CLLocationManager, didDetermineState state: CLRegionState, for region: CLRegion) {
         guard state == .inside else { return }
-        Task { @MainActor [weak self] in self?.handleTransition(entered: true) }
+        let identifier = region.identifier
+        Task { @MainActor [weak self] in self?.handleTransition(entered: true, identifier: identifier) }
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, monitoringDidFailFor region: CLRegion?, withError error: Error) {
@@ -112,10 +112,50 @@ final class CLLocationManagerGeofenceMonitor: NSObject, GeofenceRegionMonitoring
         Task { @MainActor [weak self] in self?.activityLogger.logWarning("Geofence monitoring failed for region \(id).") }
     }
 
-    private func handleTransition(entered: Bool) {
+    private func handleTransition(entered: Bool, identifier: String) {
         // Port do GeofenceBroadcastReceiver: loga a travessia (location=nil — o match é server-side) e acorda o
         // orquestrador. Sem FGS no iOS; single-flight do `runOnce` deduplica um eventual ENTER inicial + ENTER real.
+        // O Core Location pode entregar `didDetermineState(.inside)` e `didEnterRegion` para a mesma entrada.
+        // Suprimimos somente a mesma direção/região numa janela curta; EXIT após ENTER continua imediato.
+        guard transitionDeduplicator.shouldHandle(identifier: identifier, entered: entered, at: Date()) else { return }
         activityLogger.logLocation(entered ? "Entered geofence." : "Exited geofence.", nil, .info)
+#if DEBUG
+        if BackgroundValidationHarness.isEnabled {
+            Task {
+                await BackgroundValidationRecorder.shared.record(
+                    entered ? "production_geofence_enter" : "production_geofence_exit",
+                    details: ["region": identifier]
+                )
+            }
+        }
+#endif
         onGeofenceWake()
+    }
+}
+
+/// Filtro mínimo para o par `didDetermineState(.inside)` + `didEnterRegion` que o Core Location pode emitir
+/// para a mesma travessia. Não mistura regiões e não bloqueia inversão de direção.
+struct GeofenceTransitionDeduplicator: Sendable {
+    static let defaultWindow: TimeInterval = 3
+
+    private struct Transition: Sendable {
+        let entered: Bool
+        let at: Date
+    }
+
+    private var latestByRegion: [String: Transition] = [:]
+
+    mutating func shouldHandle(
+        identifier: String,
+        entered: Bool,
+        at: Date,
+        window: TimeInterval = Self.defaultWindow
+    ) -> Bool {
+        if let latest = latestByRegion[identifier], latest.entered == entered {
+            let elapsed = at.timeIntervalSince(latest.at)
+            if elapsed >= 0, elapsed < window { return false }
+        }
+        latestByRegion[identifier] = Transition(entered: entered, at: at)
+        return true
     }
 }

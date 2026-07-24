@@ -10,7 +10,7 @@ final class AccidentViewModel {
     static let autoCheckinRetries = 3
     static let autoCheckinDelaySeconds: UInt64 = 3
 
-    private(set) var uiState = AccidentUiState()
+    private(set) var uiState: AccidentUiState
     private var languageCode = "pt"
 
     private let repository: any AccidentRepository
@@ -18,10 +18,12 @@ final class AccidentViewModel {
     /// Seam do delay entre tentativas de auto-checkin — `TaskSleeper` em produção; nos testes, um sleeper
     /// instantâneo (mesmo seam usado pelo backoff de SSE) evita esperar os 6s reais (3 retries × 3s).
     private let sleeper: any Sleeping
+    private let usesFixtureState: Bool
 
     private var chave = ""
     private var sseTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
+    private var videoIdempotencyKeys: [URL: String] = [:]
     /// Token de sessão — incrementado em `onLogin`/`onLogout`. Toda `Task` em voo que mutaria `uiState`
     /// captura o token vigente no início e o revalida antes de cada escrita; se a sessão mudou nesse
     /// meio-tempo (troca de chave, logout), a resposta tardia é descartada em vez de pisar no estado novo.
@@ -31,10 +33,25 @@ final class AccidentViewModel {
     /// (lambda vazio em CheckScreen.kt). Não desligamos o automático após falha do auto-checkin.
     var onDisableAutoActivities: (@Sendable () -> Void)?
 
-    init(repository: any AccidentRepository, videoRecorder: any VideoRecording, sleeper: any Sleeping = TaskSleeper()) {
+    init(repository: any AccidentRepository, videoRecorder: any VideoRecording, sleeper: any Sleeping = TaskSleeper(),
+         initialState: AccidentUiState? = nil) {
         self.repository = repository
         self.videoRecorder = videoRecorder
         self.sleeper = sleeper
+        self.uiState = initialState ?? AccidentUiState()
+        self.usesFixtureState = initialState != nil
+    }
+
+    func setLanguageCode(_ value: String) { languageCode = value }
+
+    /// Mantém a sessão do módulo alinhada à autenticação sem reiniciá-la a cada retorno de uma tela de ajuda.
+    func synchronizeSession(chave chaveValue: String, authenticated: Bool) {
+        guard !usesFixtureState else { return }
+        if authenticated, chaveValue.count == 4 {
+            if chave != chaveValue { onLogin(chaveValue) }
+        } else if !chave.isEmpty {
+            onLogout()
+        }
     }
 
     // MARK: - Ciclo de vida
@@ -53,6 +70,7 @@ final class AccidentViewModel {
         sseTask?.cancel(); sseTask = nil
         pollTask?.cancel(); pollTask = nil
         chave = ""
+        videoIdempotencyKeys.removeAll()
         uiState = AccidentUiState()
     }
 
@@ -395,15 +413,25 @@ final class AccidentViewModel {
     /// Limpa a mensagem de emergência (fecha o banner/toast) — port de `onEmergencyMessageDismiss`.
     func onEmergencyMessageDismiss() { uiState.emergencyMessage = "" }
 
+    /// Destino seguro de notificações locais/APNs: reconcilia o estado no backend; a fila de ciência
+    /// resultante decide qual diálogo deve aparecer, sem confiar em dados sensíveis do payload push.
+    func onAccidentNotificationOpened() { refreshState() }
+
     // MARK: - Vídeo (D4 — retorna o Result; o caller DEVE inspecionar)
 
     /// D4: ao contrário do Kotlin (que descarta o `AppResult`), este método RETORNA o resultado —
     /// o chamador (tela/controller) decide DONE/ERROR a partir dele, nunca assume sucesso.
-    /// Nota: `idempotencyKey` é UUID por-CHAMADA (fiel ao Kotlin — `AccidentViewModel.kt:541` também
-    /// não persiste entre re-tentativas); persistir por-gravação é "enhancement em aberto" no decision_log D4.
     func uploadVideo(file: URL, contentType: String, onProgress: @escaping @Sendable (Double) -> Void) async -> AppResult<VideoUploadResult> {
-        await repository.uploadVideo(chave: chave, idempotencyKey: UUID().uuidString, videoFile: file,
-                                     contentType: contentType, onProgress: onProgress)
+        let idempotencyKey = videoIdempotencyKeys[file] ?? UUID().uuidString
+        videoIdempotencyKeys[file] = idempotencyKey
+        let result = await repository.uploadVideo(
+            chave: chave,
+            idempotencyKey: idempotencyKey,
+            videoFile: file,
+            contentType: contentType,
+            onProgress: onProgress)
+        if case .success = result { videoIdempotencyKeys.removeValue(forKey: file) }
+        return result
     }
 
     // MARK: - Dialogs

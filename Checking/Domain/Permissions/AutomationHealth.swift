@@ -87,7 +87,9 @@ struct HealthReport: Sendable, Equatable {
         // Notificações NEGADAS só se resolvem em Ajustes (o `requestAuthorization` devolve `false` sem UI
         // depois de negado); `notDetermined` ainda é pedível in-app pela escada.
         let notificationsNeedSettings = permissions.notificationAuthorization == .denied
-        let backgroundRefreshNeedsSettings = permissions.backgroundRefresh != .available
+        // `.restricted` é imposto pelo sistema (ex.: controle parental) e, segundo a API do UIKit,
+        // não é corrigível pelo usuário. Só `.denied` deve oferecer Ajustes como remédio.
+        let backgroundRefreshNeedsSettings = permissions.backgroundRefresh == .denied
         return locationNeedsSettings || notificationsNeedSettings || backgroundRefreshNeedsSettings
     }
 }

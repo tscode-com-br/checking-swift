@@ -23,7 +23,7 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete   # concorrência estrita
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
     CODE_SIGN_STYLE: Automatic
-    DEVELOPMENT_TEAM: ""                 # ⚠️ Marco 0 §32.3 — preencher o Apple Developer Team
+    DEVELOPMENT_TEAM: "F8Z6CMJHAR"       # Equipe configurada para os builds físicos de desenvolvimento
     PRODUCT_BUNDLE_IDENTIFIER: $(CHECKING_BUNDLE_ID)   # vem do .xcconfig
     GENERATE_INFOPLIST_FILE: NO
 

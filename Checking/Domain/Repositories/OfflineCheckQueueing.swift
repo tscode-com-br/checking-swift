@@ -4,4 +4,5 @@ import Foundation
 /// fica na camada Data. Ver port_spec_offline_replay.md §3.
 protocol OfflineCheckQueueing: Sendable {
     func enqueue(_ event: PendingCheckEvent) async
+    func clear() async
 }

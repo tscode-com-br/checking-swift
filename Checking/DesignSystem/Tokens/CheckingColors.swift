@@ -15,7 +15,7 @@ enum CheckingColors {
     static let textStrong = Color(hex: "#0F172A")
     static let textStrongAlt = Color(hex: "#1F2937")
     static let textMuted = Color(hex: "#475569")
-    static let textMutedLight = Color(hex: "#64748B")
+    static let textMutedLight = Color(hex: "#526176")
     static let textMutedSoft = Color(hex: "#94A3B8")
 
     // Estados

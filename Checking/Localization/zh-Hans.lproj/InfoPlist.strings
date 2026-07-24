@@ -1,0 +1,4 @@
+"NSLocationWhenInUseUsageDescription" = "Checking 会在您使用本应用时获取位置，以自动进行签到和签退。";
+"NSLocationAlwaysAndWhenInUseUsageDescription" = "为了在您进出已登记的工作区域时于后台自动签到和签退，Checking 需要“始终”访问您的位置。";
+"NSCameraUsageDescription" = "Checking 仅在您选择录制事故视频时使用摄像头。";
+"NSMicrophoneUsageDescription" = "Checking 仅用于录制您选择制作的事故视频中的音频。";

@@ -69,6 +69,14 @@ final class CheckRepositoryLive: CheckRepository, @unchecked Sendable {
         }
         return result
     }
+
+    func invalidateGeofenceCache() {
+        lock.withLock {
+            geofenceCache = nil
+            geofenceCachedChave = nil
+            geofenceCachedAt = nil
+        }
+    }
 }
 
 // MARK: - DTO → domínio (mappers 1:1, exatos do CheckRepositoryImpl.kt)

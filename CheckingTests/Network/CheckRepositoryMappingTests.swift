@@ -140,6 +140,21 @@ final class CheckRepositoryMappingTests: XCTestCase {
         XCTAssertEqual(api.getGeofencesCallCount, 2)
     }
 
+    func test_invalidateGeofenceCache_forcesRefetchForSameAccount() async {
+        let api = FakeCheckApi()
+        api.onGetGeofences = { _ in
+            WebGeofencesResponse(locations: [
+                GeofenceCircleDto(id: 1, local: "P80", centerLat: 1, centerLng: 2, radiusMeters: 100),
+            ])
+        }
+        let repo = CheckRepositoryLive(api: api, clock: FixedClock(iso("2026-06-16T12:00:00Z")))
+        _ = await repo.getGeofences("STSM")
+        repo.invalidateGeofenceCache()
+        _ = await repo.getGeofences("STSM")
+
+        XCTAssertEqual(api.getGeofencesCallCount, 2)
+    }
+
     // MARK: error propagation via safeApiCall
 
     func test_getState_http_error_maps_to_failure() async {

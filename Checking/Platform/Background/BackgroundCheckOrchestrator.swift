@@ -61,7 +61,7 @@ actor BackgroundCheckOrchestrator {
     func runOnce(_ trigger: OrchestratorTrigger) async {
         if isRunning { return }                        // prólogo síncrono (atômico até o 1º await): 2ª chamada CAI FORA
         isRunning = true
-        let token = backgroundTaskGuard.begin()
+        let token = await backgroundTaskGuard.begin()
         defer { backgroundTaskGuard.end(token); isRunning = false }
         isSessionExpired = false
         await runOnceLocked(trigger)
@@ -108,6 +108,8 @@ actor BackgroundCheckOrchestrator {
         await maybeNotifyAccident(chave, notifyAccident: userSettings.notifyAccident, lang: lang)
 
         if !userSettings.automaticActivitiesEnabled {
+            await pauseAlarms.scheduleStart(at: nil, notify: false, lang: lang)
+            await pauseAlarms.scheduleResume(at: nil, notify: false, lang: lang)
             EvaluationLog.shared.record(EvaluationEntry(at: clock.now(), trigger: trigger, accuracyMeters: nil,
                                                         resolvedLocal: nil, decidedAction: nil, outcome: .toggleOff))
             activityLogger.logSystem("Automatic activities are OFF.", .warning)
@@ -123,28 +125,47 @@ actor BackgroundCheckOrchestrator {
         let wasPaused = await appPrefs.getFlag(Self.flagPauseActive)   // flag PERSISTIDA
         if isScheduledPauseActiveNow(now, calendar, pauseSettings) {
             if !wasPaused {
-                if userSettings.notifyScheduledPause { notifications.postScheduledPauseTransition(started: true, lang: lang) }
+                let alreadyScheduled = await pauseAlarms.consumeScheduledTransition(
+                    started: true,
+                    dueAtOrBefore: now)
+                if userSettings.notifyScheduledPause && !alreadyScheduled {
+                    notifications.postScheduledPauseTransition(started: true, lang: lang)
+                }
                 await appPrefs.setFlag(Self.flagPauseActive, true)
                 activityLogger.logInactive("Scheduled pause started.")
             }
-            if let resume = nextResumeInstant(now, calendar, pauseSettings) { pauseAlarms.scheduleResume(at: resume) }
+            await pauseAlarms.scheduleStart(at: nil, notify: false, lang: lang)
+            await pauseAlarms.scheduleResume(
+                at: nextResumeInstant(now, calendar, pauseSettings),
+                notify: userSettings.notifyScheduledPause,
+                lang: lang)
             EvaluationLog.shared.record(EvaluationEntry(at: clock.now(), trigger: trigger, accuracyMeters: nil,
                                                         resolvedLocal: nil, decidedAction: nil, outcome: .paused))
             return
         }
         if wasPaused {
-            if userSettings.notifyScheduledPause { notifications.postScheduledPauseTransition(started: false, lang: lang) }
+            let alreadyScheduled = await pauseAlarms.consumeScheduledTransition(
+                started: false,
+                dueAtOrBefore: now)
+            if userSettings.notifyScheduledPause && !alreadyScheduled {
+                notifications.postScheduledPauseTransition(started: false, lang: lang)
+            }
             await appPrefs.setFlag(Self.flagPauseActive, false)
             activityLogger.logActive("Scheduled pause ended.")
         }
-        pauseAlarms.scheduleStart(at: nextPauseStartInstant(now, calendar, pauseSettings))
+        await pauseAlarms.scheduleResume(at: nil, notify: false, lang: lang)
+        await pauseAlarms.scheduleStart(
+            at: nextPauseStartInstant(now, calendar, pauseSettings),
+            notify: userSettings.notifyScheduledPause,
+            lang: lang)
 
         // 3 — Opções (TTL 15min + fallback offline)
         guard let options = await getLocationOptions() else { return }
 
         // 4 — Skip-if-unchanged (só TIMER)
         // NB (fiel ao Kotlin): `lastCaptureAccuracyMeters` só é resetado aqui, no bloco TIMER. Uma run
-        // .geofence/.foreground registra o valor da última run TIMER (ou nil) — mesmo comportamento do Android.
+        // .geofence/.significantLocation/.foreground registra o valor da última run TIMER (ou nil) — mesmo
+        // comportamento do Android para todos os gatilhos orientados por evento.
         if trigger == .timer {
             lastCaptureAccuracyMeters = nil
             if await shouldSkip(options.accuracyThresholdMeters) == .skip {

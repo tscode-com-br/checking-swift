@@ -1,40 +1,123 @@
+import AVFoundation
 import Foundation
 
-/// Gravação de vídeo — port de platform/camera/VideoRecorder.kt (seam; impl AVFoundation é integração,
-/// não testada por unit test — como CLLocationManager/NWPathMonitor). Ver port_spec_accident_video.md §7.
+enum VideoRecordingError: Error, Equatable {
+    case cameraUnavailable
+    case microphoneUnavailable
+    case cannotAddInput
+    case cannotAddOutput
+    case recordingFailed
+}
+
+/// Contrato da captura audiovisual. Ele fica no ator principal porque o preview e o ciclo da tela
+/// pertencem à UI; o `AVCaptureSession` mantém internamente a fila própria de captura do AVFoundation.
+@MainActor
 protocol VideoRecording: AnyObject, Sendable {
-    /// Novo arquivo temporário (prefixo `accident_video_`, extensão `.mp4`, diretório de cache).
+    var previewSession: AVCaptureSession? { get }
     func createTempFile() -> URL
-    /// Inicia a gravação no arquivo dado; câmera traseira + microfone, MP4 HD (1280×720). Retorna o
-    /// mesmo `outputFile` (a gravação continua até `stopRecording()`).
-    func startRecording(outputFile: URL) -> URL
-    func stopRecording()
+    func prepare() throws
+    func startRecording(outputFile: URL) throws -> URL
+    /// Só retorna depois que o AVFoundation finalizou o contêiner MP4 no disco.
+    func stopRecording() async throws
+    /// Interrompe a captura ao abandonar a tela, sem iniciar upload.
+    func cancelRecording()
     func isRecording() -> Bool
 }
 
-/// `VIDEO_CONTENT_TYPE` — constante do spec §7/§12.
 let videoContentType = "video/mp4"
 
-/// Impl AVFoundation fina — `AVCaptureSession` preset `.hd1280x720`, câmera traseira + mic, saída
-/// `AVCaptureMovieFileOutput` em arquivo temp. Integração (bind de câmera real); não coberta por XCTest
-/// unitário — a lógica de fase/upload (D4) é testada via fakes de `VideoRecording` na ViewModel.
+/// Captura real: câmera traseira, microfone e MP4 em 1280×720.
+/// A conclusão do delegate é aguardada antes do upload para impedir o envio de arquivo parcial.
 final class AVFoundationVideoRecorder: NSObject, VideoRecording, @unchecked Sendable {
-    // A sessão/output reais (AVCaptureSession, AVCaptureMovieFileOutput) são montados na integração de
-    // UI (bind ao preview layer). Aqui só o contrato de arquivo temp + start/stop é implementado, para
-    // não acoplar este arquivo a UIKit/SwiftUI — o bind de preview fica na camada de Feature/UI.
-    private let lock = NSLock()
-    private var recording = false
+    private let session = AVCaptureSession()
+    private let movieOutput = AVCaptureMovieFileOutput()
+    private var prepared = false
+    private var stopContinuation: CheckedContinuation<Void, Error>?
+
+    var previewSession: AVCaptureSession? { session }
 
     func createTempFile() -> URL {
-        let dir = FileManager.default.temporaryDirectory
-        return dir.appendingPathComponent("accident_video_\(UUID().uuidString)").appendingPathExtension("mp4")
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("accident_video_\(UUID().uuidString)")
+            .appendingPathExtension("mp4")
     }
-    func startRecording(outputFile: URL) -> URL {
-        lock.withLock { recording = true }
+
+    func prepare() throws {
+        guard !prepared else {
+            if !session.isRunning { session.startRunning() }
+            return
+        }
+
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+        session.sessionPreset = .hd1280x720
+
+        guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            throw VideoRecordingError.cameraUnavailable
+        }
+        guard let microphone = AVCaptureDevice.default(for: .audio) else {
+            throw VideoRecordingError.microphoneUnavailable
+        }
+
+        let cameraInput = try AVCaptureDeviceInput(device: camera)
+        let microphoneInput = try AVCaptureDeviceInput(device: microphone)
+        guard session.canAddInput(cameraInput), session.canAddInput(microphoneInput) else {
+            throw VideoRecordingError.cannotAddInput
+        }
+        session.addInput(cameraInput)
+        session.addInput(microphoneInput)
+
+        guard session.canAddOutput(movieOutput) else { throw VideoRecordingError.cannotAddOutput }
+        session.addOutput(movieOutput)
+        movieOutput.movieFragmentInterval = .invalid
+
+        prepared = true
+        session.startRunning()
+    }
+
+    func startRecording(outputFile: URL) throws -> URL {
+        try prepare()
+        if FileManager.default.fileExists(atPath: outputFile.path) {
+            try FileManager.default.removeItem(at: outputFile)
+        }
+        movieOutput.startRecording(to: outputFile, recordingDelegate: self)
         return outputFile
     }
-    func stopRecording() {
-        lock.withLock { recording = false }
+
+    func stopRecording() async throws {
+        guard movieOutput.isRecording else { return }
+        try await withCheckedThrowingContinuation { continuation in
+            stopContinuation = continuation
+            movieOutput.stopRecording()
+        }
     }
-    func isRecording() -> Bool { lock.withLock { recording } }
+
+    func cancelRecording() {
+        if movieOutput.isRecording { movieOutput.stopRecording() }
+        if session.isRunning { session.stopRunning() }
+    }
+
+    func isRecording() -> Bool { movieOutput.isRecording }
+}
+
+extension AVFoundationVideoRecorder: AVCaptureFileOutputRecordingDelegate {
+    nonisolated func fileOutput(
+        _ output: AVCaptureFileOutput,
+        didFinishRecordingTo outputFileURL: URL,
+        from connections: [AVCaptureConnection],
+        error: Error?
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let continuation = stopContinuation
+            stopContinuation = nil
+            if let error {
+                continuation?.resume(throwing: error)
+            } else if FileManager.default.fileExists(atPath: outputFileURL.path) {
+                continuation?.resume()
+            } else {
+                continuation?.resume(throwing: VideoRecordingError.recordingFailed)
+            }
+        }
+    }
 }

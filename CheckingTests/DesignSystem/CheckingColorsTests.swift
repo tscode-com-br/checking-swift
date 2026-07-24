@@ -2,8 +2,8 @@ import SwiftUI
 import XCTest
 @testable import Checking
 
-/// Guarda de regressão contra dígito trocado: afirma o hex EXATO de cada token de `CheckingColors` (port de
-/// Color.kt). Sem isto, um `#0F766E`→`#0F776E` passaria despercebido (achado LOW da revisão).
+/// Guarda de regressão contra dígito trocado e contraste insuficiente. O único desvio deliberado do
+/// Android é `textMutedLight`, escurecido no iOS para manter folga sobre WCAG AA com antialiasing.
 final class CheckingColorsTests: XCTestCase {
 
     func test_everyTokenMatchesKotlinHex() {
@@ -18,7 +18,7 @@ final class CheckingColorsTests: XCTestCase {
             (CheckingColors.textStrong, "#0F172A"),
             (CheckingColors.textStrongAlt, "#1F2937"),
             (CheckingColors.textMuted, "#475569"),
-            (CheckingColors.textMutedLight, "#64748B"),
+            (CheckingColors.textMutedLight, "#526176"),
             (CheckingColors.textMutedSoft, "#94A3B8"),
             (CheckingColors.success, "#166534"),
             (CheckingColors.warning, "#92400E"),
@@ -76,5 +76,41 @@ final class CheckingColorsTests: XCTestCase {
         XCTAssertEqual(n.onError, Color(hex: "#FFFFFF"))
         XCTAssertEqual(n.outline, Color(hex: "#CBD5E1"))
         XCTAssertEqual(n.outlineVariant, Color(hex: "#E2E8F0"))
+    }
+
+    func test_textBackgroundPairsMeetWCAGAA() {
+        let pairs = [
+            ("0F172A", "FFFFFF"), // texto principal / card
+            ("526176", "FFFFFF"), // texto secundário / card
+            ("0F172A", "E6F2F0"), // escolha selecionada
+            ("FFFFFF", "0F766E"), // botão primário
+            ("FFFFFF", "115E59"), // gradiente primário escuro
+            ("FFFFFF", "C8222A"), // botão de acidente
+        ]
+        for (foreground, background) in pairs {
+            XCTAssertGreaterThanOrEqual(
+                contrastRatio(foreground, background), 4.5,
+                "contraste insuficiente #\(foreground) / #\(background)")
+        }
+    }
+
+    func test_splashMotionPolicyRemovesAnimationAndLongWait() {
+        XCTAssertEqual(SplashMotionPolicy.animationDuration(reduceMotion: true), 0)
+        XCTAssertEqual(SplashMotionPolicy.finishDelay(reduceMotion: true), 0.2)
+        XCTAssertEqual(SplashMotionPolicy.animationDuration(reduceMotion: false), 1)
+        XCTAssertEqual(SplashMotionPolicy.finishDelay(reduceMotion: false), 1.45)
+    }
+
+    private func contrastRatio(_ first: String, _ second: String) -> Double {
+        let values = [relativeLuminance(first), relativeLuminance(second)].sorted()
+        return (values[1] + 0.05) / (values[0] + 0.05)
+    }
+
+    private func relativeLuminance(_ hex: String) -> Double {
+        let components = Color.rgbaComponents(hex: hex)
+        let channels = [components.r, components.g, components.b].map { channel in
+            channel <= 0.03928 ? channel / 12.92 : pow((channel + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
     }
 }

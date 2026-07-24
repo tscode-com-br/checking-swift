@@ -54,14 +54,16 @@ final class GeofenceRegionManagerTests: XCTestCase {
         XCTAssertEqual(region?.radiusMeters, 150)
     }
 
-    func test_register_emptyList_doesNothing() async {
+    func test_register_emptyList_clearsPreviouslyMonitoredRegions() async {
         let (sut, monitor, logger) = makeSUT(.success([]))
         await sut.register(chave: "STSM")
         let count = await monitor.syncCount
-        XCTAssertEqual(count, 0)                             // fiel ao Kotlin: early return em lista vazia
-        XCTAssertTrue(logger.system.isEmpty)
+        let synced = await monitor.syncedRegions
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(synced, [])
+        XCTAssertEqual(logger.system.first?.message, "Geofences registered (0).")
         let summary = await sut.lastSummary
-        XCTAssertNil(summary)
+        XCTAssertEqual(summary, GeofenceRegistrationSummary(monitored: 0, omitted: 0))
     }
 
     func test_register_failure_doesNothing() async {

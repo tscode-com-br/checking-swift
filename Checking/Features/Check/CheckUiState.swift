@@ -11,6 +11,10 @@ enum NotificationTone: Sendable, Equatable {
     case none, info, success, error, teal
 }
 
+enum UiInformeType: Sendable, Equatable {
+    case normal, retroativo
+}
+
 struct PasswordChangeFields: Sendable, Equatable {
     var oldPw = ""
     var newPw = ""
@@ -30,6 +34,13 @@ struct SelfRegistrationFields: Sendable, Equatable {
     var isBusy = false
     var projectCatalog: [Project] = []
     var isLoadingProjects = false
+}
+
+struct CheckHistoryDialogState: Sendable, Equatable {
+    var action: CheckAction = .checkIn
+    var entries: [CheckHistoryEntry] = []
+    var isLoading = false
+    var isError = false
 }
 
 struct CheckUiState: Sendable, Equatable {
@@ -54,6 +65,11 @@ struct CheckUiState: Sendable, Equatable {
     var dialogOpen: CheckDialog?
     var passwordChangeFields = PasswordChangeFields()
     var selfRegistrationFields = SelfRegistrationFields()
+    var historyDialog = CheckHistoryDialogState()
+    var activityEntries: [ActivityLogEntry] = []
+    var activityNextOffset = 0
+    var activityCanLoadMore = false
+    var isActivitiesLoading = false
 
     // Settings espelhadas (do userSettingsJson)
     var automaticActivitiesEnabled = false
@@ -65,6 +81,7 @@ struct CheckUiState: Sendable, Equatable {
     var notifyActivities = true
     var notifyScheduledPause = true
     var notifyAccident = true
+    var backgroundLocationConsentGranted = false
 
     // Main-screen (defaults; preenchidos pelo slice de main-screen)
     var isHistoryLoading = false
@@ -73,18 +90,24 @@ struct CheckUiState: Sendable, Equatable {
     var selectedManualLocation: String?
     var userProjects: UserProjects?
     var isProjectsLoading = false
+    var mainProjectCatalog: [Project] = []
     var isLocationLoading = false
+    var locationPermissionSufficient = false
+    var permissionsStatus: PermissionsStatus?
+    var availableLocations: [String] = []
     var showAutoActivitiesNudge = false
     var isSubmitting = false
-    var requiresManualLocation = false
     var locationMatch: LocationMatch?
     var selectedAction: CheckAction = .checkIn
+    var selectedInforme: UiInformeType = .normal
 
     // Derivações
     var isAuthenticated: Bool { authStatus?.authenticated == true }
     var isFound: Bool { authStatus?.found == true }
     var hasPassword: Bool { authStatus?.hasPassword == true }
     var isAwaitingApproval: Bool { authStatus?.pendingApproval == true }
+    var isAccuracyTooLow: Bool { locationMatch?.status == .accuracyTooLow }
+    var requiresManualLocation: Bool { !automaticActivitiesEnabled || isAccuracyTooLow }
 
     var canSubmit: Bool {
         guard isAuthenticated && !isSubmitting else { return false }

@@ -1,0 +1,4 @@
+"NSLocationWhenInUseUsageDescription" = "O Checking usa sua localização para registrar check-in e check-out automáticos enquanto você usa o app.";
+"NSLocationAlwaysAndWhenInUseUsageDescription" = "Para registrar check-in e check-out automaticamente em segundo plano quando você entra e sai das áreas de trabalho, o Checking precisa de acesso à localização Sempre.";
+"NSCameraUsageDescription" = "O Checking usa a câmera apenas para gravar o vídeo de um acidente que você optar por registrar.";
+"NSMicrophoneUsageDescription" = "O Checking usa o microfone apenas para gravar o áudio do vídeo de um acidente que você optar por registrar.";

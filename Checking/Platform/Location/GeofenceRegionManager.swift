@@ -7,13 +7,20 @@ struct GeofenceRegistrationSummary: Sendable, Equatable {
     var omitted: Int
 }
 
+/// Ciclo de vida consumido pela camada de apresentação. Mantém o `CheckViewModel` testável e garante que
+/// registrar/remover regiões deixe de depender da antiga tela técnica de validação física.
+protocol GeofenceRegionManaging: Sendable {
+    func register(chave: String, hints: GeofencePriorityHints, forceRefresh: Bool) async
+    func unregisterAll() async
+}
+
 /// Port de platform/background/GeofenceManager.kt (§23.2, T3B.9). Busca os círculos do projeto, prioriza
 /// sob o cap de 20 do iOS (`GeofenceRegionPrioritizer` — lógica nova, sem contraparte Android) e entrega ao
 /// monitor. Geofences são só GATILHOS de acordar; o match preciso é sempre no servidor (Approach A).
 ///
 /// `actor`: `lastSummary` é estado mutável lido pelo diagnóstico de outra isolação. Erros são engolidos
 /// (fiel ao Kotlin — o BGAppRefreshTask/foreground são o caminho primário; geofence é oportunista).
-actor GeofenceRegionManager {
+actor GeofenceRegionManager: GeofenceRegionManaging {
     private let checkRepository: any CheckRepository
     private let monitor: any GeofenceRegionMonitoring
     private let activityLogger: any ActivityLogging
@@ -27,13 +34,25 @@ actor GeofenceRegionManager {
 
     /// Busca os círculos e (re)registra o conjunto priorizado. Idempotente. `hints` prioriza a seleção
     /// quando há posição/local atual conhecidos; sem eles, cai na ordem por id (ainda determinística).
-    func register(chave: String, hints: GeofencePriorityHints = GeofencePriorityHints()) async {
+    func register(
+        chave: String,
+        hints: GeofencePriorityHints = GeofencePriorityHints(),
+        forceRefresh: Bool = false
+    ) async {
+        if forceRefresh { checkRepository.invalidateGeofenceCache() }
         let circles: [GeofenceCircle]
         switch await checkRepository.getGeofences(chave) {
         case .success(let c): circles = c
         case .failure: return                       // engole — fiel ao Kotlin (early return no Failure)
         }
-        guard !circles.isEmpty else { return }       // fiel ao Kotlin (early return em lista vazia)
+        // Uma resposta vazia após troca de projeto/conta precisa remover regiões antigas. Preservá-las
+        // manteria despertares associados a locais que já não pertencem ao usuário.
+        guard !circles.isEmpty else {
+            await monitor.sync([])
+            lastSummary = GeofenceRegistrationSummary(monitored: 0, omitted: 0)
+            activityLogger.logSystem("Geofences registered (0).", .info)
+            return
+        }
 
         let selection = GeofenceRegionPrioritizer.select(circles, hints: hints)
         let regions = selection.selected.map {

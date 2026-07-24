@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Observation
 
@@ -20,6 +21,9 @@ final class VideoRecordController {
     private var recordedFile: URL?
     private var uploadResult: AppResult<VideoUploadResult>?    // última tentativa — p/ inspeção em teste
 
+    var previewSession: AVCaptureSession? { videoRecorder.previewSession }
+    var canRetryUpload: Bool { recordedFile != nil && phase == .error }
+
     init(videoRecorder: any VideoRecording,
          uploadVideo: @escaping @Sendable (URL, String, @escaping @Sendable (Double) -> Void) async -> AppResult<VideoUploadResult>) {
         self.videoRecorder = videoRecorder
@@ -29,16 +33,27 @@ final class VideoRecordController {
     /// Gravação AUTO-INICIA ao entrar na tela (após bind câmera+mic — aqui: chamado quando ambas as
     /// permissões estão concedidas). Câmera/mic são pedidos NO MOMENTO da gravação (spec §7).
     func startRecording() {
-        let file = videoRecorder.createTempFile()
-        recordedFile = videoRecorder.startRecording(outputFile: file)
-        phase = .recording
+        do {
+            let file = videoRecorder.createTempFile()
+            recordedFile = try videoRecorder.startRecording(outputFile: file)
+            phase = .recording
+        } catch {
+            phase = .error
+            statusMessage = t("accident.video.error")
+        }
     }
 
     /// Para a gravação e envia. D4: transita p/ `.done` SÓ em `.success`; `.error` em `.failure`
     /// (o temp é deletado/retido pelo repositório — não aqui).
     func stopRecordingAndUpload() async {
         guard phase != .uploading else { return }   // reentrância: 2º toque durante upload em voo não duplica
-        if videoRecorder.isRecording() { videoRecorder.stopRecording() }
+        do {
+            if videoRecorder.isRecording() { try await videoRecorder.stopRecording() }
+        } catch {
+            phase = .error
+            statusMessage = t("accident.video.error")
+            return
+        }
         guard let file = recordedFile else { return }
         phase = .uploading
         statusMessage = t("accident.video.sending")
@@ -58,6 +73,6 @@ final class VideoRecordController {
 
     /// Limpeza ao sair da tela — port do `DisposableEffect { onDispose { if isRecording stopRecording } }`.
     func onScreenDisposed() {
-        if videoRecorder.isRecording() { videoRecorder.stopRecording() }
+        if videoRecorder.isRecording() { videoRecorder.cancelRecording() }
     }
 }

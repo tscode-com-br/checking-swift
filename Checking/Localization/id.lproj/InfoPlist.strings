@@ -1,0 +1,4 @@
+"NSLocationWhenInUseUsageDescription" = "Checking menggunakan lokasi Anda untuk melakukan check-in dan check-out otomatis saat Anda menggunakan aplikasi.";
+"NSLocationAlwaysAndWhenInUseUsageDescription" = "Untuk melakukan check-in dan check-out otomatis di latar belakang saat Anda memasuki dan meninggalkan tempat kerja terdaftar, Checking memerlukan akses lokasi Selalu.";
+"NSCameraUsageDescription" = "Checking hanya menggunakan kamera saat Anda memilih untuk merekam video kecelakaan.";
+"NSMicrophoneUsageDescription" = "Checking hanya menggunakan mikrofon untuk merekam audio video kecelakaan yang Anda pilih untuk buat.";

@@ -16,6 +16,15 @@ final class FakeLocationProvider: LocationProvider, @unchecked Sendable {
 }
 
 final class FakeCheckRepository: CheckRepository, @unchecked Sendable {
+    struct SubmitCall: Equatable {
+        let chave: String
+        let projeto: String
+        let action: CheckAction
+        let local: String?
+        let informe: InformeType
+        let eventTime: Date
+        let clientEventId: String
+    }
     var matchLocationResult: AppResult<LocationMatch> = .failure(.unknown(description: nil))
     var getStateResult: AppResult<HistoryState> = .failure(.unknown(description: nil))
     var getHistoryResult: AppResult<[CheckHistoryEntry]> = .success([])
@@ -27,6 +36,7 @@ final class FakeCheckRepository: CheckRepository, @unchecked Sendable {
     private(set) var submitCount = 0
     private(set) var lastSubmitAction: CheckAction?
     private(set) var lastSubmitLocal: String?
+    private(set) var submitCalls: [SubmitCall] = []
 
     func matchLocation(_ lat: Double, _ lon: Double, _ accuracyMeters: Double?) async -> AppResult<LocationMatch> { matchLocationResult }
     func getState(_ chave: String) async -> AppResult<HistoryState> { getStateResult }
@@ -38,6 +48,8 @@ final class FakeCheckRepository: CheckRepository, @unchecked Sendable {
         submitCount += 1
         lastSubmitAction = action
         lastSubmitLocal = local
+        submitCalls.append(SubmitCall(chave: chave, projeto: projeto, action: action, local: local,
+                                      informe: informe, eventTime: eventTime, clientEventId: clientEventId))
         if let handler = submitHandler { return handler(action, local) }
         return submitResult
     }
@@ -45,7 +57,9 @@ final class FakeCheckRepository: CheckRepository, @unchecked Sendable {
 
 final class FakeOfflineQueue: OfflineCheckQueueing, @unchecked Sendable {
     private(set) var enqueued: [PendingCheckEvent] = []
+    private(set) var clearCount = 0
     func enqueue(_ event: PendingCheckEvent) async { enqueued.append(event) }
+    func clear() async { enqueued.removeAll(); clearCount += 1 }
 }
 
 struct NoopActivityLogger: ActivityLogging {}

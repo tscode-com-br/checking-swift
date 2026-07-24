@@ -5,6 +5,21 @@ import XCTest
 // Logger REAL + DAO in-memory + InlineLogScheduler. Ver docs/port_spec_decision_engine.md §9.3.
 final class CaptureLocationLoggingTests: XCTestCase {
 
+    private actor SlowCountingCapture: LocationCapturing {
+        private(set) var callCount = 0
+        let result: LocationCaptureResult
+
+        init(result: LocationCaptureResult) {
+            self.result = result
+        }
+
+        func callAsFunction(_ accuracyThresholdMeters: Int) async -> LocationCaptureResult {
+            callCount += 1
+            try? await Task.sleep(for: .milliseconds(50))
+            return result
+        }
+    }
+
     private func run(provider: LocationCapture, match: AppResult<LocationMatch>, dao: CapturingDao) async -> LocationCaptureResult {
         let repo = FakeCheckRepository(); repo.matchLocationResult = match
         let logger = ActivityLogger(clock: FixedClock(iso("2026-06-20T08:00:00Z")),
@@ -43,5 +58,32 @@ final class CaptureLocationLoggingTests: XCTestCase {
                           match: .success(ucMatch(.matched, "Unidade P80")), dao: dao)
         guard case .matched = r else { return XCTFail("expected matched, got \(r)") }
         XCTAssertEqual(dao.rows.count, 0)
+    }
+
+    func test_concurrentRequestsWithSameAccuracyShareOneCapture() async {
+        let expected = LocationCaptureResult.matched(ucMatch(.matched, "Escritório Principal"))
+        let base = SlowCountingCapture(result: expected)
+        let sut = CoalescingLocationCapture(base: base)
+
+        async let first = sut(30)
+        async let second = sut(30)
+        let results = await [first, second]
+        let count = await base.callCount
+
+        XCTAssertEqual(results, [expected, expected])
+        XCTAssertEqual(count, 1)
+    }
+
+    func test_concurrentRequestsWithDifferentAccuracyRemainIndependent() async {
+        let expected = LocationCaptureResult.matched(ucMatch(.matched, "Escritório Principal"))
+        let base = SlowCountingCapture(result: expected)
+        let sut = CoalescingLocationCapture(base: base)
+
+        async let first = sut(30)
+        async let second = sut(50)
+        _ = await [first, second]
+        let count = await base.callCount
+
+        XCTAssertEqual(count, 2)
     }
 }

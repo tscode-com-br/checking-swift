@@ -36,4 +36,16 @@ final class UserSettingsTests: XCTestCase {
         XCTAssertNil(map)
         XCTAssertFalse(resolvePersistedUserSettings(map, "HR70").automaticActivitiesEnabled)   // auto OFF
     }
+
+    func test_withPersistedUserSettings_preserves_other_accounts_and_normalizes_projects() {
+        let other = UserSettings(projects: ["OTHER"], activeProject: "OTHER", automaticActivitiesEnabled: false)
+        let next = UserSettings(projects: [" p80 ", "P80"], activeProject: "", automaticActivitiesEnabled: true)
+
+        let result = withPersistedUserSettings(["ABCD": other], "hr-70", next)
+
+        XCTAssertEqual(result["ABCD"], other)
+        XCTAssertEqual(result["HR70"]?.projects, ["P80"])
+        XCTAssertEqual(result["HR70"]?.activeProject, "P80")
+        XCTAssertEqual(result["HR70"]?.automaticActivitiesEnabled, true)
+    }
 }

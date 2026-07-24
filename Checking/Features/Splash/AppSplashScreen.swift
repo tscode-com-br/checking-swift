@@ -1,5 +1,10 @@
 import SwiftUI
 
+enum SplashMotionPolicy {
+    static func animationDuration(reduceMotion: Bool) -> Double { reduceMotion ? 0 : 1 }
+    static func finishDelay(reduceMotion: Bool) -> Double { reduceMotion ? 0.2 : 1.45 }
+}
+
 /// Splash — o logo do Checking sobre fundo teal, com UMA animação: o "V" do checkmark desenhado
 /// progressivamente, como à mão. Port 1:1 de presentation/splash/AppSplashScreen.kt (§10). Coordenadas no
 /// viewBox 220×170; `translate(18,16)` externo + `rotate(-12°)` pivot (74,70). Reduce Motion → estado final.
@@ -9,6 +14,7 @@ import SwiftUI
 /// closure de `Canvas` por frame; por isso o trim fica no `Shape`, não no `Canvas` (achado HIGH da revisão).
 struct AppSplashScreen: View {
     let onFinished: () -> Void
+    var forceReduceMotion = false
 
     @State private var progress: CGFloat = 0
     @State private var finished = false
@@ -35,7 +41,7 @@ struct AppSplashScreen: View {
                 .accessibilityHidden(true)
 
                 Text(Self.appVersion)
-                    .font(.custom("Arimo-Regular", size: 12)).tracking(1)
+                    .font(.custom("Arimo-Regular", size: 12, relativeTo: .caption2)).tracking(1)
                     .foregroundStyle(.white.opacity(0.9))
                     .padding(.top, 8)
             }
@@ -45,7 +51,7 @@ struct AppSplashScreen: View {
                 VStack(spacing: 2) {
                     ForEach(Self.credits, id: \.self) { name in
                         Text(name)
-                            .font(.custom("Arimo-Regular", size: 13.75)).tracking(1.5)   // labelSmall 11 + 25%
+                            .font(.custom("Arimo-Regular", size: 13.75, relativeTo: .caption)).tracking(1.5)
                             .foregroundStyle(.white)
                             .multilineTextAlignment(.center)
                     }
@@ -58,14 +64,18 @@ struct AppSplashScreen: View {
     }
 
     private func start() {
-        if reduceMotion {
+        let shouldReduceMotion = reduceMotion || forceReduceMotion
+        if shouldReduceMotion {
             progress = 1                                    // §13: Reduce Motion cai no estado final
         } else {
             // tween(1000ms, FastOutSlowInEasing) → curva Material exata cubic-bezier(0.4, 0, 0.2, 1).
-            withAnimation(.timingCurve(0.4, 0, 0.2, 1, duration: 1)) { progress = 1 }
+            withAnimation(.timingCurve(
+                0.4, 0, 0.2, 1,
+                duration: SplashMotionPolicy.animationDuration(reduceMotion: false))) { progress = 1 }
         }
-        // delay 450ms após a animação → onFinished (navega p/ CHECK). Guard contra dupla-chamada.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.45) {
+        // Com Reduce Motion não existe animação a aguardar; preservamos apenas um instante para a marca.
+        let finishDelay = SplashMotionPolicy.finishDelay(reduceMotion: shouldReduceMotion)
+        DispatchQueue.main.asyncAfter(deadline: .now() + finishDelay) {
             guard !finished else { return }
             finished = true
             onFinished()

@@ -106,3 +106,33 @@ func resolvePersistedUserSettings(_ settingsByChave: [String: UserSettings]?, _ 
         suspendSundays: record.suspendSundays, notifyActivities: record.notifyActivities,
         notifyScheduledPause: record.notifyScheduledPause, notifyAccident: record.notifyAccident)
 }
+
+/// Atualiza uma única chave sem destruir as configurações das demais contas. Port 1:1 de
+/// `withPersistedUserSettings` do Android, incluindo normalização de projetos e chave.
+func withPersistedUserSettings(
+    _ settingsByChave: [String: UserSettings]?,
+    _ chave: String,
+    _ nextSettings: UserSettings,
+    defaults: UserSettingsDefaults = UserSettingsDefaults()
+) -> [String: UserSettings] {
+    let normalizedChave = sanitizeSettingsChave(chave)
+    var currentMap = settingsByChave ?? [:]
+    guard normalizedChave.count == 4 else { return currentMap }
+
+    let fallbackProjects = resolveFallbackProjects(defaults)
+    let sourceProjects = nextSettings.projects.isEmpty && !nextSettings.activeProject.isEmpty
+        ? [nextSettings.activeProject]
+        : nextSettings.projects
+    let resolvedProjects = normalizeProjectValues(sourceProjects, defaults.allowedProjects, fallbackProjects)
+    let resolvedActiveProject = normalizeProjectValue(
+        nextSettings.activeProject,
+        resolvedProjects,
+        resolveFallbackActiveProject(defaults, resolvedProjects)
+    )
+
+    var normalized = nextSettings
+    normalized.projects = resolvedProjects
+    normalized.activeProject = resolvedActiveProject
+    currentMap[normalizedChave] = normalized
+    return currentMap
+}

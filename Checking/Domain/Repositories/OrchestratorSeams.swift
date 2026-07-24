@@ -42,22 +42,26 @@ protocol AutoActivityNotifying: Sendable {
 
 /// "Wake lock" iOS = `beginBackgroundTask` (prazo do sistema; §9). No-op nos testes; release preservado no `defer`.
 protocol BackgroundTaskGuard: Sendable {
-    func begin() -> Int
+    func begin() async -> Int
     func end(_ token: Int)
 }
 struct NoopBackgroundTaskGuard: BackgroundTaskGuard {
-    func begin() -> Int { 0 }
+    func begin() async -> Int { 0 }
     func end(_ token: Int) {}
 }
 
-/// Alarme exato de pausa (start/resume) — sem equivalente no iOS; best-effort/no-op (§9). `at == nil` cancela.
+/// Transições de pausa no iOS. Não acorda o processo para executar código, mas agenda notificações locais
+/// no relógio do sistema; o motor reconcilia o estado no próximo evento de localização/BGTask/foreground.
 protocol PauseAlarmScheduling: Sendable {
-    func scheduleResume(at: Date)
-    func scheduleStart(at: Date?)
+    func scheduleResume(at: Date?, notify: Bool, lang: String) async
+    func scheduleStart(at: Date?, notify: Bool, lang: String) async
+    /// Evita repetir, no próximo despertar do processo, uma transição que já teve notificação agendada.
+    func consumeScheduledTransition(started: Bool, dueAtOrBefore now: Date) async -> Bool
 }
 struct NoopPauseAlarmScheduling: PauseAlarmScheduling {
-    func scheduleResume(at: Date) {}
-    func scheduleStart(at: Date?) {}
+    func scheduleResume(at: Date?, notify: Bool, lang: String) async {}
+    func scheduleStart(at: Date?, notify: Bool, lang: String) async {}
+    func consumeScheduledTransition(started: Bool, dueAtOrBefore now: Date) async -> Bool { false }
 }
 
 /// Contrato do motor automático (permite fakear o use-case nos testes do orquestrador).
@@ -67,7 +71,10 @@ protocol RunningAutomaticActivities: Sendable {
 }
 extension RunAutomaticActivitiesUseCase: RunningAutomaticActivities {}
 
-/// Resolve o código de idioma efetivo — port mínimo de `resolveEffectiveLanguageCode` (i18n slice expande).
 func resolveEffectiveLanguageCode(_ stored: String) -> String {
-    stored.isEmpty ? "pt" : stored
+    if !stored.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let resolved = resolveLanguageCode(stored, fallback: "")
+        if !resolved.isEmpty { return resolved }
+    }
+    return detectDeviceLanguageCode()
 }

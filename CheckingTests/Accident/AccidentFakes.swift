@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 @testable import Checking
 
@@ -115,13 +116,44 @@ final class FakeVideoRecording: VideoRecording, @unchecked Sendable {
     var stopCallCount: Int { lock.withLock { stopCalls } }
     var tempFile = URL(fileURLWithPath: "/tmp/accident_video_test.mp4")
 
+    var previewSession: AVCaptureSession? { nil }
+
     func createTempFile() -> URL { tempFile }
-    func startRecording(outputFile: URL) -> URL {
+    func prepare() throws {}
+    func startRecording(outputFile: URL) throws -> URL {
         lock.withLock { recording = true; startCalls += 1 }
         return outputFile
     }
-    func stopRecording() { lock.withLock { recording = false; stopCalls += 1 } }
+    func stopRecording() async throws { lock.withLock { recording = false; stopCalls += 1 } }
+    func cancelRecording() { lock.withLock { recording = false; stopCalls += 1 } }
     func isRecording() -> Bool { lock.withLock { recording } }
+}
+
+final class FakeAccidentVideoUploader: AccidentVideoUploading, @unchecked Sendable {
+    private let lock = NSLock()
+    var responseData = Data()
+    var error: Error?
+    private(set) var receivedChave = ""
+    private(set) var receivedIdempotencyKey = ""
+    private(set) var receivedVideoFile: URL?
+
+    func upload(
+        chave: String,
+        idempotencyKey: String,
+        videoFile: URL,
+        contentType: String,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws -> Data {
+        lock.withLock {
+            receivedChave = chave
+            receivedIdempotencyKey = idempotencyKey
+            receivedVideoFile = videoFile
+        }
+        if let error { throw error }
+        onProgress(0.5)
+        onProgress(1)
+        return responseData
+    }
 }
 
 /// Contador thread-safe — p/ closures `@Sendable` que precisam mutar um contador capturado em teste.

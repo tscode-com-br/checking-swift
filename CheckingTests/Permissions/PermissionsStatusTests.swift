@@ -73,4 +73,35 @@ final class PermissionsStatusTests: XCTestCase {
         XCTAssertEqual(PermissionsInspectorLive.mapNotificationAuthorization(.denied), .denied)
         XCTAssertEqual(PermissionsInspectorLive.mapNotificationAuthorization(.notDetermined), .notDetermined)
     }
+
+    func test_mapNotificationSetting_preservesEveryNativeState() {
+        XCTAssertEqual(PermissionsInspectorLive.mapNotificationSetting(.enabled), .enabled)
+        XCTAssertEqual(PermissionsInspectorLive.mapNotificationSetting(.disabled), .disabled)
+        XCTAssertEqual(PermissionsInspectorLive.mapNotificationSetting(.notSupported), .notSupported)
+    }
+
+    func test_notificationDelivery_reportsWhetherAnyVisualDestinationIsEnabled() {
+        let hidden = NotificationDeliveryStatus(
+            alerts: .disabled, lockScreen: .disabled, notificationCenter: .disabled,
+            badges: .enabled, sounds: .enabled, scheduledDelivery: .disabled)
+        XCTAssertFalse(hidden.hasVisibleDestination)
+
+        let visible = NotificationDeliveryStatus(
+            alerts: .disabled, lockScreen: .enabled, notificationCenter: .disabled,
+            badges: .disabled, sounds: .disabled, scheduledDelivery: .disabled)
+        XCTAssertTrue(visible.hasVisibleDestination)
+    }
+
+    func test_globalLocationServicesOff_makesLocationOperationallyUnavailable() {
+        let s = PermissionsStatus(
+            locationAuthorization: .always,
+            preciseAccuracy: true,
+            cameraMicGranted: true,
+            notificationAuthorization: .authorized,
+            lowPowerMode: false,
+            backgroundRefresh: .available,
+            locationServicesEnabled: false)
+        XCTAssertFalse(s.preciseLocationGranted)
+        XCTAssertFalse(s.alwaysLocationGranted)
+    }
 }

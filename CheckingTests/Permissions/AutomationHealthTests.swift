@@ -104,9 +104,12 @@ final class AutomationHealthTests: XCTestCase {
         XCTAssertTrue(report(status(auth: .denied, precise: true)).needsOpenSettings)
     }
 
-    func test_needsOpenSettings_trueWhenBackgroundRefreshNotAvailable() {
+    func test_needsOpenSettings_trueWhenBackgroundRefreshDenied() {
         XCTAssertTrue(report(status(bg: .denied)).needsOpenSettings)
-        XCTAssertTrue(report(status(bg: .restricted)).needsOpenSettings)
+    }
+
+    func test_needsOpenSettings_falseWhenBackgroundRefreshRestrictedBySystem() {
+        XCTAssertFalse(report(status(bg: .restricted)).needsOpenSettings)
     }
 
     func test_needsOpenSettings_falseWhenNotDeterminedOrWhenInUse() {
