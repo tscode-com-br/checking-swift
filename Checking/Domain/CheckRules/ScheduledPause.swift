@@ -4,12 +4,17 @@ import Foundation
 // ZonedDateTime → (Date + Calendar com a TimeZone relevante). DayOfWeek → Calendar weekday
 // (gregoriano: 1=domingo … 7=sábado). Ver docs/port_spec_decision_engine.md §5.
 
-struct ScheduledPauseSettings: Sendable, Equatable {
+struct ScheduledPauseSettings: Sendable, Equatable, Codable {
     var scheduledPauseEnabled: Bool
     var scheduledPauseFrom: String   // "HH:mm"
     var scheduledPauseTo: String     // "HH:mm"
     var suspendSaturdays: Bool
     var suspendSundays: Bool
+}
+
+struct ScheduledPauseWindow: Sendable, Equatable {
+    let start: Date
+    let end: Date
 }
 
 private func parseMinutesOfDay(_ hhmm: String) -> Int {
@@ -99,4 +104,24 @@ func nextPauseStartInstant(_ now: Date, _ calendar: Calendar, _ settings: Schedu
     }
 
     return candidates.sorted().first { isScheduledPauseActiveNow($0, calendar, settings) }
+}
+
+/// Ocorrência contínua que contém `now`. As pausas diárias e os dias inteiros podem se sobrepor;
+/// por isso o início é uma transição real de inativo para ativo, não apenas o horário "De".
+func currentScheduledPauseWindow(
+    _ now: Date,
+    _ calendar: Calendar,
+    _ settings: ScheduledPauseSettings
+) -> ScheduledPauseWindow? {
+    guard let end = nextResumeInstant(now, calendar, settings) else { return nil }
+    // Todas as regras têm resolução de minuto. Andar sobre `Date` (instantes absolutos), partindo do
+    // início do minuto, também atravessa corretamente gaps/repetições de DST e produz fallback estável.
+    var start = calendar.dateInterval(of: .minute, for: now)?.start ?? now
+    let maximumContinuousMinutes = 10 * 24 * 60
+    for _ in 0..<maximumContinuousMinutes {
+        let previous = start.addingTimeInterval(-60)
+        guard isScheduledPauseActiveNow(previous, calendar, settings) else { break }
+        start = previous
+    }
+    return ScheduledPauseWindow(start: start, end: end)
 }

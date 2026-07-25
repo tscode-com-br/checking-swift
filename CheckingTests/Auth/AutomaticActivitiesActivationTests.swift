@@ -15,7 +15,9 @@ final class AutomaticActivitiesActivationTests: XCTestCase {
         vm.onChaveChanged("HR70")
         await settle { vm.uiState.authStatus != nil }
         vm.onPasswordChanged("abc")
-        await settle(timeout: 2) { vm.uiState.isAuthenticated && vm.uiState.userProjects != nil }
+        await settle(timeout: 2) {
+            vm.uiState.isAuthenticated && vm.uiState.userProjects != nil && !vm.uiState.isProjectsLoading
+        }
         let evaluationsBeforeEnable = h.orchestrator.runOnceCalls.count
 
         let enabled = await vm.setAutomaticActivitiesEnabled(true)
@@ -47,7 +49,9 @@ final class AutomaticActivitiesActivationTests: XCTestCase {
         vm.onChaveChanged("HR70")
         await settle { vm.uiState.authStatus != nil }
         vm.onPasswordChanged("abc")
-        await settle(timeout: 2) { vm.uiState.isAuthenticated && vm.uiState.userProjects != nil }
+        await settle(timeout: 2) {
+            vm.uiState.isAuthenticated && vm.uiState.userProjects != nil && !vm.uiState.isProjectsLoading
+        }
 
         let enabled = await vm.setAutomaticActivitiesEnabled(true)
         let startCount = await h.significantLocationMonitor.startCount
@@ -69,7 +73,9 @@ final class AutomaticActivitiesActivationTests: XCTestCase {
         vm.onChaveChanged("HR70")
         await settle { vm.uiState.authStatus != nil }
         vm.onPasswordChanged("abc")
-        await settle(timeout: 2) { vm.uiState.isAuthenticated && vm.uiState.userProjects != nil }
+        await settle(timeout: 2) {
+            vm.uiState.isAuthenticated && vm.uiState.userProjects != nil && !vm.uiState.isProjectsLoading
+        }
         let evaluationsBeforeEnable = h.orchestrator.runOnceCalls.count
 
         let enabled = await vm.setAutomaticActivitiesEnabled(true)

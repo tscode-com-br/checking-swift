@@ -7,7 +7,7 @@ let iosEnglishStrings: [String: String] = [
     "auth.showPasswordAria": "Show password",
     "auth.hidePasswordAria": "Hide password",
     "status.submitFailed": "The activity could not be recorded. Check your connection and try again.",
-    "projects.noActiveProject": "Select at least one project to continue.",
+    "projects.noActiveProject": "The user is not registered in any project.",
     "location.manualSelectPlaceholder": "Select a location",
     "location.selectManualLocation": "Select the location where the activity will be recorded.",
 
@@ -22,6 +22,10 @@ let iosEnglishStrings: [String: String] = [
     "autoActivities.notAllowed": "Not Allowed",
     "autoActivities.openSettings": "Open Settings",
     "autoActivities.request": "Request",
+    "autoActivities.notification.lowAccuracyCheckinTitle": "Check-in - Failed!",
+    "autoActivities.notification.lowAccuracyCheckoutTitle": "Check-out - Failed!",
+    "autoActivities.notification.lowAccuracyGenericTitle": "Automatic activity - Failed!",
+    "autoActivities.notification.lowAccuracyBody": "Low accuracy. Will try again.",
 
     "support.title": "Support",
     "support.lead": "When you need help from a person, Settings › Support prepares a WhatsApp conversation with your key already included in the first message.",

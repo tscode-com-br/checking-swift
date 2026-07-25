@@ -89,4 +89,48 @@ final class AutoActivitiesUseCaseTests: XCTestCase {
     func test_no_history_near_not_registered_no_action() async {
         let (r, repo) = await run(ucMatch(.notInKnownLocation, nearest: 500.0), ucHistory(nil)); assertNoAction(r, repo)
     }
+
+    func test_accuracy_too_low_after_checkout_exposes_expected_checkin_without_submit() async {
+        let (result, repo) = await run(ucMatch(.accuracyTooLow), ucHistory(.checkOut))
+
+        XCTAssertEqual(result, .accuracyTooLow(expectedAction: .checkIn))
+        XCTAssertEqual(repo.submitCount, 0)
+    }
+
+    func test_accuracy_too_low_without_previous_action_exposes_expected_checkin_without_submit() async {
+        let (result, repo) = await run(ucMatch(.accuracyTooLow), nil)
+
+        XCTAssertEqual(result, .accuracyTooLow(expectedAction: .checkIn))
+        XCTAssertEqual(repo.submitCount, 0)
+    }
+
+    func test_accuracy_too_low_after_checkin_keeps_expected_action_ambiguous_without_submit() async {
+        let (result, repo) = await run(ucMatch(.accuracyTooLow), ucHistory(.checkIn))
+
+        XCTAssertEqual(result, .accuracyTooLow(expectedAction: nil))
+        XCTAssertEqual(repo.submitCount, 0)
+    }
+
+    func test_timeout_and_permissionLossRemainDistinctForRetryEpisodeLifecycle() async {
+        func execute(_ capture: LocationCaptureResult) async -> AutoActivitiesResult {
+            let useCase = RunAutomaticActivitiesUseCase(
+                captureLocationUseCase: FakeCaptureLocation(capture),
+                checkRepository: FakeCheckRepository(),
+                offlineQueue: FakeOfflineQueue(),
+                clock: FixedClock(iso("2026-06-16T12:00:00Z")),
+                activityLogger: NoopActivityLogger())
+            return await useCase(
+                chave: "STSM",
+                userProjects: UserProjects(projects: ["P80"], activeProject: "P80"),
+                currentState: ucHistory(.checkOut),
+                mixedZoneIntervalMinutes: 15,
+                accuracyThresholdMeters: 50)
+        }
+
+        let timeout = await execute(.timeout)
+        let noPermission = await execute(.noPermission)
+
+        XCTAssertEqual(timeout, .locationTimeout)
+        XCTAssertEqual(noPermission, .noPermission)
+    }
 }

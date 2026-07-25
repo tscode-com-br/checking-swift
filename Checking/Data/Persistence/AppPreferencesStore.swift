@@ -53,6 +53,18 @@ final class UserDefaultsPreferencesStore: AppPreferencesStore, @unchecked Sendab
     }
     func getFlag(_ name: String) async -> Bool { defaults.bool(forKey: "pref_flag_\(name)") }
     func setFlag(_ name: String, _ value: Bool) async { defaults.set(value, forKey: "pref_flag_\(name)") }
+    func accuracyRetryEpisodeJson() async -> String { string("pref_accuracy_retry_episode_json") }
+    func setAccuracyRetryEpisodeJson(_ json: String) async {
+        if json.isEmpty { defaults.removeObject(forKey: "pref_accuracy_retry_episode_json") }
+        else { defaults.set(json, forKey: "pref_accuracy_retry_episode_json") }
+    }
+    func scheduledPauseDeferralJson() async -> String {
+        string("pref_scheduled_pause_deferral_json")
+    }
+    func setScheduledPauseDeferralJson(_ json: String) async {
+        if json.isEmpty { defaults.removeObject(forKey: "pref_scheduled_pause_deferral_json") }
+        else { defaults.set(json, forKey: "pref_scheduled_pause_deferral_json") }
+    }
 
     /// LGPD art. 18 — limpa TODAS as preferências do app (`pref_*`).
     func clearAll() async {

@@ -22,6 +22,7 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
             nextTriggerDate: Date?
         )] = []
         private var removedIdentifiers: [[String]] = []
+        private var removedDeliveredIdentifiers: [[String]] = []
         var requests: [(
             identifier: String,
             title: String,
@@ -33,6 +34,7 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
             lock.withLock { recorded }
         }
         var removals: [[String]] { lock.withLock { removedIdentifiers } }
+        var deliveredRemovals: [[String]] { lock.withLock { removedDeliveredIdentifiers } }
 
         func add(_ request: UNNotificationRequest) async throws {
             lock.withLock {
@@ -49,6 +51,28 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
         func removePendingNotificationRequests(withIdentifiers identifiers: [String]) {
             lock.withLock { removedIdentifiers.append(identifiers) }
         }
+
+        func removeDeliveredNotifications(withIdentifiers identifiers: [String]) {
+            lock.withLock { removedDeliveredIdentifiers.append(identifiers) }
+        }
+    }
+
+    private final class BlockingCenter: ScheduledNotificationCenter, @unchecked Sendable {
+        let addGate = AsyncGate()
+        private let lock = NSLock()
+        private var addStartedValue = false
+        private var removedIdentifiers: [[String]] = []
+        var addStarted: Bool { lock.withLock { addStartedValue } }
+        var removals: [[String]] { lock.withLock { removedIdentifiers } }
+
+        func add(_ request: UNNotificationRequest) async throws {
+            lock.withLock { addStartedValue = true }
+            await addGate.wait()
+        }
+        func removePendingNotificationRequests(withIdentifiers identifiers: [String]) {
+            lock.withLock { removedIdentifiers.append(identifiers) }
+        }
+        func removeDeliveredNotifications(withIdentifiers identifiers: [String]) {}
     }
 
     private func makeSUT() -> (AutoActivityNotificationsLive, SpyCenter) {
@@ -165,6 +189,32 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
         XCTAssertNotEqual(requests[0].identifier, requests[1].identifier)
     }
 
+    func test_lowAccuracyNotification_usesExpectedActionAndStableLocalizedContent() async {
+        let (sut, spy) = makeSUT()
+        await sut.postLowAccuracyNotification(expectedAction: .checkIn, lang: "pt")
+        await sut.postLowAccuracyNotification(expectedAction: .checkIn, lang: "pt")
+
+        let requests = await awaitRequests(spy, count: 2)
+        XCTAssertEqual(requests.map(\.identifier), ["autoActivities.lowAccuracy", "autoActivities.lowAccuracy"])
+        XCTAssertEqual(requests.first?.title, "Check-in - Falha!")
+        XCTAssertEqual(requests.first?.body, "Baixa Precisão. Tentará novamente.")
+        XCTAssertEqual(requests.first?.event, "low_accuracy")
+    }
+
+    func test_lowAccuracyNotification_usesGenericTitleWhenActionIsAmbiguous_andCanBeCleared() async {
+        let (sut, spy) = makeSUT()
+        await sut.postLowAccuracyNotification(expectedAction: nil, lang: "en")
+        let requests = await awaitRequests(spy)
+
+        XCTAssertEqual(requests.first?.title, "Automatic activity - Failed!")
+        XCTAssertEqual(requests.first?.body, "Low accuracy. Will try again.")
+
+        await sut.clearLowAccuracyNotification()
+
+        XCTAssertEqual(spy.removals.last, ["autoActivities.lowAccuracy"])
+        XCTAssertEqual(spy.deliveredRemovals.last, ["autoActivities.lowAccuracy"])
+    }
+
     func test_pauseScheduler_postsTimedStart_andConsumesItAfterDueTime() async {
         let spy = SpyCenter()
         let suite = "br.com.tscode.checking.tests.pause.\(UUID().uuidString)"
@@ -179,6 +229,8 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
         XCTAssertEqual(spy.requests.first?.body, "Checking em pausa.")
         XCTAssertEqual(spy.requests.first?.event, "scheduled_pause_started")
         XCTAssertNotNil(spy.requests.first?.nextTriggerDate)
+        let pendingRemovalsBeforeConsume = spy.removals
+        let deliveredRemovalsBeforeConsume = spy.deliveredRemovals
         let beforeDue = await sut.consumeScheduledTransition(
             started: true,
             dueAtOrBefore: fireDate.addingTimeInterval(-1))
@@ -191,6 +243,8 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
         XCTAssertFalse(beforeDue)
         XCTAssertTrue(atDue)
         XCTAssertFalse(afterConsume)
+        XCTAssertEqual(spy.removals, pendingRemovalsBeforeConsume)
+        XCTAssertEqual(spy.deliveredRemovals, deliveredRemovalsBeforeConsume)
     }
 
     func test_pauseScheduler_cancelledOrDisabled_doesNotLeaveRequest() async {
@@ -204,6 +258,31 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
 
         XCTAssertTrue(spy.requests.isEmpty)
         XCTAssertFalse(spy.removals.isEmpty)
+        XCTAssertEqual(spy.deliveredRemovals.last, ["scheduledPause.transition.resume"])
+    }
+
+    func test_pauseScheduler_serializesCancellationAfterInflightAdd() async {
+        let center = BlockingCenter()
+        let suite = "br.com.tscode.checking.tests.pause.serial.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let sut = LocalNotificationPauseAlarmScheduler(center: center, defaults: defaults)
+        let scheduling = Task {
+            await sut.scheduleResume(at: Date().addingTimeInterval(120), notify: true, lang: "pt")
+        }
+        await waitUntil { center.addStarted }
+
+        let cancellation = Task {
+            await sut.scheduleResume(at: nil, notify: false, lang: "pt")
+        }
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(center.removals.count, 1, "cancel deve aguardar o add em voo")
+
+        await center.addGate.release()
+        await scheduling.value
+        await cancellation.value
+        XCTAssertEqual(center.removals.count, 2)
+        XCTAssertEqual(center.removals.last, ["scheduledPause.transition.resume"])
     }
 
     func test_accidentPushPayloadRecognition_acceptsContractVariants() {

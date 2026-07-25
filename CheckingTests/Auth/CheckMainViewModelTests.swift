@@ -24,7 +24,8 @@ final class CheckMainViewModelTests: XCTestCase {
         autoEnabled: Bool = false,
         consentGranted: Bool = false,
         captureResult: LocationCaptureResult = .noPermission,
-        submitResult: AppResult<HistoryState>? = nil
+        submitResult: AppResult<HistoryState>? = nil,
+        userProjects: UserProjects = UserProjects(projects: ["P80"], activeProject: "P80")
     ) async -> (VMHarness, CheckViewModel) {
         let h = VMHarness()
         if autoEnabled {
@@ -43,7 +44,7 @@ final class CheckMainViewModelTests: XCTestCase {
             Project(id: 1, name: "P80", transportEnabled: false),
             Project(id: 2, name: "P81", transportEnabled: false),
         ])
-        h.projects.userProjectsResult = .success(UserProjects(projects: ["P80"], activeProject: "P80"))
+        h.projects.userProjectsResult = .success(userProjects)
         h.checkRepository.getLocationsResult = .success(LocationOptions(
             items: ["Escritório Principal", "Unidade P80"],
             accuracyThresholdMeters: 50,
@@ -56,7 +57,13 @@ final class CheckMainViewModelTests: XCTestCase {
         await settle { vm.uiState.authStatus != nil }
         vm.onPasswordChanged("abc123")
         vm.submitLogin()
-        await settle { vm.uiState.isAuthenticated && vm.uiState.userProjects != nil && !vm.uiState.availableLocations.isEmpty }
+        await settle {
+            vm.uiState.isAuthenticated
+                && vm.uiState.userProjects != nil
+                && !vm.uiState.isProjectsLoading
+                && (vm.uiState.userProjects?.projects.isEmpty == true
+                    || !vm.uiState.availableLocations.isEmpty)
+        }
         return (h, vm)
     }
 
@@ -71,6 +78,25 @@ final class CheckMainViewModelTests: XCTestCase {
             from: Data((await h.prefs.userSettingsJson()).utf8))
         XCTAssertEqual(map?["HR70"]?.projects, ["P80"])
         XCTAssertEqual(map?["HR70"]?.activeProject, "P80")
+        h.teardown()
+    }
+
+    func test_authenticationWithoutMembershipShowsSpecificMessageAndPersistsEmptyState() async {
+        let (h, vm) = await authenticatedHarness(
+            userProjects: UserProjects(projects: [], activeProject: ""))
+
+        XCTAssertEqual(vm.uiState.userProjects, UserProjects(projects: [], activeProject: ""))
+        XCTAssertEqual(
+            vm.uiState.notificationPrimary,
+            "O usuário não está cadastrado em nenhum projeto.")
+        XCTAssertEqual(vm.uiState.notificationTone, .error)
+        XCTAssertTrue(vm.uiState.availableLocations.isEmpty)
+
+        let map = try? JSONCoding.decoder.decode(
+            [String: UserSettings].self,
+            from: Data((await h.prefs.userSettingsJson()).utf8))
+        XCTAssertEqual(map?["HR70"]?.projects, [])
+        XCTAssertEqual(map?["HR70"]?.activeProject, "")
         h.teardown()
     }
 
@@ -89,13 +115,24 @@ final class CheckMainViewModelTests: XCTestCase {
         XCTAssertTrue(state.canSubmit)
     }
 
-    func test_removingLastProjectIsRejectedBeforeRepositoryCall() async {
+    func test_removingLastProjectPersistsEmptyMemberships() async {
         let (h, vm) = await authenticatedHarness()
+        h.projects.updateUserProjectsResult = .success(UserProjects(projects: [], activeProject: ""))
         vm.onProjectMembershipToggled("P80")
+        await settle { !vm.uiState.isProjectMembershipSyncing }
 
-        XCTAssertEqual(vm.uiState.notificationPrimary, t("projects.selectAtLeastOne", lang: "pt"))
+        XCTAssertEqual(h.projects.updateUserProjectsCalls, [[]])
+        XCTAssertEqual(vm.uiState.userProjects, UserProjects(projects: [], activeProject: ""))
+        let map = try? JSONCoding.decoder.decode(
+            [String: UserSettings].self,
+            from: Data((await h.prefs.userSettingsJson()).utf8))
+        XCTAssertEqual(map?["HR70"]?.projects, [])
+        XCTAssertEqual(map?["HR70"]?.activeProject, "")
+        XCTAssertEqual(
+            vm.uiState.notificationPrimary,
+            t("projects.noActiveProject", lang: "pt"))
         XCTAssertEqual(vm.uiState.notificationTone, .error)
-        XCTAssertTrue(h.projects.updateUserProjectsCalls.isEmpty)
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 1)
         h.teardown()
     }
 
@@ -104,10 +141,229 @@ final class CheckMainViewModelTests: XCTestCase {
         vm.onManualLocationSelected("Escritório Principal")
         h.projects.updateUserProjectsResult = .success(UserProjects(projects: ["P80", "P81"], activeProject: "P80"))
         vm.onProjectMembershipToggled("P81")
-        await settle { vm.uiState.userProjects?.projects == ["P80", "P81"] && !vm.uiState.isProjectsLoading }
+        await settle { vm.uiState.userProjects?.projects == ["P80", "P81"] && !vm.uiState.isProjectMembershipSyncing }
 
         XCTAssertEqual(h.projects.updateUserProjectsCalls, [["P80", "P81"]])
         XCTAssertNil(vm.uiState.selectedManualLocation)
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 0)
+        h.teardown()
+    }
+
+    func test_rapidSelectionsFromEmptyAreCoalescedAndBothPersist() async {
+        let (h, vm) = await authenticatedHarness(
+            userProjects: UserProjects(projects: [], activeProject: ""))
+        h.projects.updateUserProjectsResult = .success(
+            UserProjects(projects: ["P80", "P81"], activeProject: "P80"))
+
+        vm.onProjectMembershipToggled("P80")
+        vm.onProjectMembershipToggled("P81")
+        await settle { !vm.uiState.isProjectMembershipSyncing }
+
+        XCTAssertEqual(h.projects.updateUserProjectsCalls, [["P80", "P81"]])
+        XCTAssertEqual(
+            vm.uiState.userProjects,
+            UserProjects(projects: ["P80", "P81"], activeProject: "P80"))
+        h.teardown()
+    }
+
+    func test_serverResponseIsAuthoritativeAfterMembershipUpdate() async {
+        let (h, vm) = await authenticatedHarness()
+        h.projects.updateUserProjectsResult = .success(
+            UserProjects(projects: ["P81"], activeProject: "P81"))
+
+        vm.onProjectMembershipToggled("P81")
+        await settle { !vm.uiState.isProjectMembershipSyncing }
+
+        XCTAssertEqual(h.projects.updateUserProjectsCalls, [["P80", "P81"]])
+        XCTAssertEqual(vm.uiState.userProjects, UserProjects(projects: ["P81"], activeProject: "P81"))
+        h.teardown()
+    }
+
+    func test_updateFailureRollsBackOptimisticMembershipSelection() async {
+        let (h, vm) = await authenticatedHarness()
+        h.projects.updateUserProjectsResult = .failure(.network)
+        vm.onManualLocationSelected("Unidade P80")
+
+        vm.onProjectMembershipToggled("P81")
+        XCTAssertEqual(vm.uiState.userProjects?.projects, ["P80", "P81"])
+        await settle { !vm.uiState.isProjectMembershipSyncing }
+
+        XCTAssertEqual(vm.uiState.userProjects, UserProjects(projects: ["P80"], activeProject: "P80"))
+        XCTAssertEqual(vm.uiState.selectedManualLocation, "Unidade P80")
+        XCTAssertEqual(vm.uiState.notificationPrimary, t("projects.updateFailed", lang: "pt"))
+        XCTAssertEqual(vm.uiState.notificationTone, .error)
+        h.teardown()
+    }
+
+    func test_toggleDuringInFlightUpdateQueuesOrderedAuthoritativePut() async {
+        let (h, vm) = await authenticatedHarness()
+        let firstGate = AsyncGate()
+        h.projects.firstUpdateUserProjectsGate = firstGate
+        h.projects.updateUserProjectsResults = [
+            .success(UserProjects(projects: ["P80", "P81"], activeProject: "P80")),
+            .success(UserProjects(projects: ["P81"], activeProject: "P81")),
+        ]
+
+        vm.onProjectMembershipToggled("P81")
+        await settle { h.projects.updateUserProjectsCalls.count == 1 }
+        vm.onProjectMembershipToggled("P80")
+        XCTAssertEqual(vm.uiState.userProjects?.projects, ["P81"])
+        await firstGate.release()
+        await settle { !vm.uiState.isProjectMembershipSyncing }
+
+        XCTAssertEqual(h.projects.updateUserProjectsCalls, [["P80", "P81"], ["P81"]])
+        XCTAssertEqual(vm.uiState.userProjects, UserProjects(projects: ["P81"], activeProject: "P81"))
+        h.teardown()
+    }
+
+    func test_secondSelectionFromEmptyDuringFirstPutPersistsBothProjects() async {
+        let (h, vm) = await authenticatedHarness(
+            userProjects: UserProjects(projects: [], activeProject: ""))
+        let firstGate = AsyncGate()
+        h.projects.firstUpdateUserProjectsGate = firstGate
+        h.projects.updateUserProjectsResults = [
+            .success(UserProjects(projects: ["P80"], activeProject: "P80")),
+            .success(UserProjects(projects: ["P80", "P81"], activeProject: "P80")),
+        ]
+
+        vm.onProjectMembershipToggled("P80")
+        await settle { h.projects.updateUserProjectsCalls.count == 1 }
+        vm.onProjectMembershipToggled("P81")
+        XCTAssertEqual(vm.uiState.userProjects?.projects, ["P80", "P81"])
+        await firstGate.release()
+        await settle { !vm.uiState.isProjectMembershipSyncing }
+
+        XCTAssertEqual(h.projects.updateUserProjectsCalls, [["P80"], ["P80", "P81"]])
+        XCTAssertEqual(
+            vm.uiState.userProjects,
+            UserProjects(projects: ["P80", "P81"], activeProject: "P80"))
+        h.teardown()
+    }
+
+    func test_lateMembershipResponseAfterAccountChangeIsIgnored() async {
+        let (h, vm) = await authenticatedHarness()
+        let firstGate = AsyncGate()
+        h.projects.firstUpdateUserProjectsGate = firstGate
+
+        vm.onProjectMembershipToggled("P81")
+        await settle { h.projects.updateUserProjectsCalls.count == 1 }
+        vm.onChaveChanged("NEW1")
+        await firstGate.release()
+        await settle { vm.uiState.chave == "NEW1" && !vm.uiState.isProjectMembershipSyncing }
+
+        XCTAssertNil(vm.uiState.userProjects)
+        XCTAssertTrue(vm.uiState.mainProjectCatalog.isEmpty)
+        h.teardown()
+    }
+
+    func test_submitStaysDisabledUntilMembershipUpdateIsConfirmed() async {
+        let (h, vm) = await authenticatedHarness()
+        let gate = AsyncGate()
+        h.projects.firstUpdateUserProjectsGate = gate
+        vm.onActionSelected(.checkOut)
+
+        vm.onProjectMembershipToggled("P81")
+        await settle { h.projects.updateUserProjectsCalls.count == 1 }
+
+        XCTAssertTrue(vm.uiState.isProjectMembershipSyncing)
+        XCTAssertFalse(vm.uiState.canSubmit)
+
+        await gate.release()
+        await settle { !vm.uiState.isProjectMembershipSyncing }
+        XCTAssertTrue(vm.uiState.canSubmit)
+        h.teardown()
+    }
+
+    func test_manualSubmitWithoutMembershipDoesNotCallRepositoryAndExplainsWhy() async {
+        let (h, vm) = await authenticatedHarness(
+            userProjects: UserProjects(projects: [], activeProject: ""))
+        vm.onActionSelected(.checkOut)
+
+        vm.onSubmit()
+
+        XCTAssertEqual(h.checkRepository.submitCount, 0)
+        XCTAssertEqual(
+            vm.uiState.notificationPrimary,
+            t("projects.noActiveProject", lang: "pt"))
+        XCTAssertNotEqual(
+            vm.uiState.notificationPrimary,
+            t("status.submitFailed", lang: "pt"))
+        XCTAssertEqual(vm.uiState.notificationTone, .error)
+        h.teardown()
+    }
+
+    func test_submitConflictRefreshesStaleMembershipAndExplainsNoProject() async {
+        let (h, vm) = await authenticatedHarness(submitResult: .failure(.conflict))
+        h.projects.userProjectsResult = .success(UserProjects(projects: [], activeProject: ""))
+        vm.onManualLocationSelected("Unidade P80")
+
+        vm.onSubmit()
+        await settle {
+            !vm.uiState.isSubmitting
+                && vm.uiState.userProjects == UserProjects(projects: [], activeProject: "")
+        }
+
+        XCTAssertEqual(h.checkRepository.submitCount, 1)
+        XCTAssertEqual(
+            vm.uiState.notificationPrimary,
+            t("projects.noActiveProject", lang: "pt"))
+        XCTAssertNotEqual(
+            vm.uiState.notificationPrimary,
+            t("status.submitFailed", lang: "pt"))
+        let map = try? JSONCoding.decoder.decode(
+            [String: UserSettings].self,
+            from: Data((await h.prefs.userSettingsJson()).utf8))
+        XCTAssertEqual(map?["HR70"]?.projects, [])
+        XCTAssertEqual(map?["HR70"]?.activeProject, "")
+        h.teardown()
+    }
+
+    func test_toggleDuringReconciliationThenFailureRollsBackAndReconcilesAuthoritativeStateAgain() async {
+        let (h, vm) = await authenticatedHarness()
+        await settle { !h.orchestrator.runOnceCalls.isEmpty }
+        let runsBefore = h.orchestrator.runOnceCalls.count
+        let reconciliationGate = AsyncGate()
+        h.orchestrator.nextRunGate = reconciliationGate
+        h.projects.updateUserProjectsResults = [
+            .success(UserProjects(projects: ["P80", "P81"], activeProject: "P80")),
+            .failure(.network),
+        ]
+
+        vm.onProjectMembershipToggled("P81")
+        await settle { h.orchestrator.runOnceCalls.count == runsBefore + 1 }
+        vm.onProjectMembershipToggled("P80")
+        XCTAssertEqual(vm.uiState.userProjects?.projects, ["P81"])
+
+        await reconciliationGate.release()
+        await settle { !vm.uiState.isProjectMembershipSyncing }
+
+        XCTAssertEqual(h.projects.updateUserProjectsCalls, [["P80", "P81"], ["P81"]])
+        XCTAssertEqual(
+            vm.uiState.userProjects,
+            UserProjects(projects: ["P80", "P81"], activeProject: "P80"))
+        XCTAssertGreaterThanOrEqual(h.orchestrator.runOnceCalls.count, runsBefore + 2)
+        XCTAssertEqual(vm.uiState.notificationPrimary, t("projects.updateFailed", lang: "pt"))
+        h.teardown()
+    }
+
+    func test_successAfterIntermediateFailureClearsStaleUpdateError() async {
+        let (h, vm) = await authenticatedHarness()
+        let firstGate = AsyncGate()
+        h.projects.firstUpdateUserProjectsGate = firstGate
+        h.projects.updateUserProjectsResults = [
+            .failure(.network),
+            .success(UserProjects(projects: ["P81"], activeProject: "P81")),
+        ]
+
+        vm.onProjectMembershipToggled("P81")
+        await settle { h.projects.updateUserProjectsCalls.count == 1 }
+        vm.onProjectMembershipToggled("P80")
+        await firstGate.release()
+        await settle { !vm.uiState.isProjectMembershipSyncing }
+
+        XCTAssertEqual(vm.uiState.userProjects, UserProjects(projects: ["P81"], activeProject: "P81"))
+        XCTAssertNotEqual(vm.uiState.notificationPrimary, t("projects.updateFailed", lang: "pt"))
+        XCTAssertNotEqual(vm.uiState.notificationTone, .error)
         h.teardown()
     }
 
@@ -127,6 +383,28 @@ final class CheckMainViewModelTests: XCTestCase {
         XCTAssertEqual(call?.informe, .retroativo)
         XCTAssertEqual(vm.uiState.notificationPrimary, t("status.checkinCompleted", lang: "pt"))
         XCTAssertEqual(vm.uiState.notificationTone, .success)
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 1)
+        XCTAssertEqual(h.orchestrator.acceptedChecks.count, 1)
+        XCTAssertEqual(h.orchestrator.acceptedChecks.first?.0, "HR70")
+        XCTAssertEqual(h.orchestrator.acceptedChecks.first?.1, "P80")
+        XCTAssertEqual(h.orchestrator.acceptedChecks.first?.2, .checkIn)
+        XCTAssertEqual(h.orchestrator.acceptedChecks.first?.3, newHistory)
+        h.teardown()
+    }
+
+    func test_manualSuccessInvalidatesAccuracyRetryOnlyAfterServerConfirmation() async {
+        let gate = AsyncGate()
+        let (h, vm) = await authenticatedHarness(submitResult: .success(history(action: .checkIn)))
+        h.checkRepository.submitGate = gate
+        vm.onManualLocationSelected("Unidade P80")
+
+        vm.onSubmit()
+        await settle { h.checkRepository.submitCount == 1 }
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 0)
+
+        await gate.release()
+        await settle { h.orchestrator.invalidateAccuracyRetryCount == 1 }
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 1)
         h.teardown()
     }
 
@@ -134,7 +412,7 @@ final class CheckMainViewModelTests: XCTestCase {
         let (h, vm) = await authenticatedHarness(submitResult: .success(history()))
         vm.onManualLocationSelected("Escritório Principal")
         vm.onProjectMembershipToggled("P81")
-        await settle { !vm.uiState.isProjectsLoading }
+        await settle { !vm.uiState.isProjectMembershipSyncing }
         vm.onActionSelected(.checkOut)
         vm.onSubmit()
         await settle { h.checkRepository.submitCount == 1 }
@@ -145,8 +423,14 @@ final class CheckMainViewModelTests: XCTestCase {
 
     func test_networkFailureQueuesSameDecidedEventIdentityAndTimestamp() async {
         let (h, vm) = await authenticatedHarness(submitResult: .failure(.network))
+        let enqueueGate = AsyncGate()
+        h.offlineQueue.enqueueGate = enqueueGate
         vm.onManualLocationSelected("Unidade P80")
         vm.onSubmit()
+        await settle { h.checkRepository.submitCount == 1 }
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 0)
+
+        await enqueueGate.release()
         await settle { !h.offlineQueue.enqueued.isEmpty }
 
         let submitted = try! XCTUnwrap(h.checkRepository.submitCalls.first)
@@ -158,7 +442,36 @@ final class CheckMainViewModelTests: XCTestCase {
         XCTAssertEqual(queued.action, "checkin")
         XCTAssertEqual(queued.local, "Unidade P80")
         XCTAssertEqual(vm.uiState.notificationPrimary, t("status.savedOffline", lang: "pt"))
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 1)
+        XCTAssertTrue(h.orchestrator.acceptedChecks.isEmpty)
         h.teardown()
+    }
+
+    func test_manualRejectedSubmissionsDoNotInvalidateAccuracyRetry() async {
+        let failures: [ApiError] = [
+            .unauthorized,
+            .conflict,
+            .http(status: 422, detail: "invalid"),
+        ]
+
+        for failure in failures {
+            let (h, vm) = await authenticatedHarness(submitResult: .failure(failure))
+            vm.onManualLocationSelected("Unidade P80")
+
+            vm.onSubmit()
+            await settle {
+                h.checkRepository.submitCount == 1
+                    && (!vm.uiState.isSubmitting || !vm.uiState.isAuthenticated)
+            }
+
+            if case .unauthorized = failure {
+                await settle { h.orchestrator.invalidateAccuracyRetryCount == 1 }
+                XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 1)
+            } else {
+                XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 0, "\(failure)")
+            }
+            h.teardown()
+        }
     }
 
     func test_manualSubmitIsBlockedWhileAutomaticModeHasNormalMatch() async {
@@ -296,6 +609,63 @@ final class CheckMainViewModelTests: XCTestCase {
         h.teardown()
     }
 
+    func test_foregroundResumeRefreshesMembershipRemovedByAnotherClient() async {
+        let (h, vm) = await authenticatedHarness()
+        h.projects.userProjectsResult = .success(UserProjects(projects: [], activeProject: ""))
+        let invalidationsBefore = h.orchestrator.invalidateAccuracyRetryCount
+
+        vm.onForegroundResume()
+        await settle {
+            vm.uiState.userProjects == UserProjects(projects: [], activeProject: "")
+                && vm.uiState.notificationPrimary == t("projects.noActiveProject", lang: "pt")
+                && !vm.uiState.isProjectsLoading
+        }
+
+        XCTAssertTrue(vm.uiState.availableLocations.isEmpty)
+        let map = try? JSONCoding.decoder.decode(
+            [String: UserSettings].self,
+            from: Data((await h.prefs.userSettingsJson()).utf8))
+        XCTAssertEqual(map?["HR70"]?.projects, [])
+        XCTAssertEqual(map?["HR70"]?.activeProject, "")
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, invalidationsBefore + 1)
+        h.teardown()
+    }
+
+    func test_foregroundMembershipRefreshWithSameActiveProjectKeepsRetryEpisode() async {
+        let (h, vm) = await authenticatedHarness()
+        let projectLoadsBefore = h.projects.getUserProjectsCallCount
+        let invalidationsBefore = h.orchestrator.invalidateAccuracyRetryCount
+
+        vm.onForegroundResume()
+        await settle {
+            h.projects.getUserProjectsCallCount > projectLoadsBefore
+                && !vm.uiState.isProjectsLoading
+        }
+
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, invalidationsBefore)
+        h.teardown()
+    }
+
+    func test_enablingAutomaticActivitiesWithoutMembershipShowsSpecificMessage() async {
+        let (h, vm) = await authenticatedHarness(
+            userProjects: UserProjects(projects: [], activeProject: ""))
+        let projectLoadsBefore = h.projects.getUserProjectsCallCount
+
+        vm.toggleAutomaticActivities(true)
+        await settle {
+            h.projects.getUserProjectsCallCount > projectLoadsBefore
+                && vm.uiState.notificationPrimary == t("projects.noActiveProject", lang: "pt")
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertFalse(vm.uiState.automaticActivitiesEnabled)
+        XCTAssertNotEqual(
+            vm.uiState.notificationPrimary,
+            t("autoActivities.enableFailed", lang: "pt"))
+        XCTAssertEqual(vm.uiState.notificationTone, .error)
+        h.teardown()
+    }
+
     func test_accountKeyChangeRemovesPreviousGeofences() async {
         let (h, vm) = await authenticatedHarness()
         vm.recordBackgroundLocationConsent()
@@ -315,6 +685,7 @@ final class CheckMainViewModelTests: XCTestCase {
         vm.recordBackgroundLocationConsent()
         _ = await vm.setAutomaticActivitiesEnabled(true)
         let unregistersBefore = await h.geofenceRegionManager.unregisterCount
+        let invalidationsBefore = h.orchestrator.invalidateAccuracyRetryCount
 
         let disabled = await vm.setAutomaticActivitiesEnabled(false)
         let monitorActive = await h.significantLocationMonitor.isActive()
@@ -323,6 +694,7 @@ final class CheckMainViewModelTests: XCTestCase {
         XCTAssertTrue(disabled)
         XCTAssertFalse(monitorActive)
         XCTAssertGreaterThan(unregistersAfter, unregistersBefore)
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, invalidationsBefore + 1)
         h.teardown()
     }
 
@@ -335,7 +707,7 @@ final class CheckMainViewModelTests: XCTestCase {
             UserProjects(projects: ["P80", "P81"], activeProject: "P80"))
 
         vm.onProjectMembershipToggled("P81")
-        await settle { !vm.uiState.isProjectsLoading }
+        await settle { !vm.uiState.isProjectMembershipSyncing }
         try? await Task.sleep(for: .milliseconds(50))
         let registrationsAfter = await h.geofenceRegionManager.registrations.count
         let lastRegistration = await h.geofenceRegionManager.registrations.last

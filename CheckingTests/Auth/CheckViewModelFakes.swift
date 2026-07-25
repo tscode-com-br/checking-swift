@@ -56,11 +56,27 @@ final class FakeProjectRepository: ProjectRepository, @unchecked Sendable {
     var result: AppResult<[Project]> = .success([])
     var userProjectsResult: AppResult<UserProjects> = .success(UserProjects(projects: ["P80"], activeProject: "P80"))
     var updateUserProjectsResult: AppResult<UserProjects>?
-    private(set) var updateUserProjectsCalls: [[String]] = []
+    var updateUserProjectsResults: [AppResult<UserProjects>] = []
+    var firstUpdateUserProjectsGate: AsyncGate?
+    private let lock = NSLock()
+    private var recordedGetUserProjectsCalls = 0
+    private var recordedUpdateUserProjectsCalls: [[String]] = []
+    var getUserProjectsCallCount: Int { lock.withLock { recordedGetUserProjectsCalls } }
+    var updateUserProjectsCalls: [[String]] { lock.withLock { recordedUpdateUserProjectsCalls } }
     func listProjects() async -> AppResult<[Project]> { result }
-    func getUserProjects() async -> AppResult<UserProjects> { userProjectsResult }
+    func getUserProjects() async -> AppResult<UserProjects> {
+        lock.withLock { recordedGetUserProjectsCalls += 1 }
+        return userProjectsResult
+    }
     func updateUserProjects(_ projectNames: [String]) async -> AppResult<UserProjects> {
-        updateUserProjectsCalls.append(projectNames)
+        let callIndex = lock.withLock { () -> Int in
+            recordedUpdateUserProjectsCalls.append(projectNames)
+            return recordedUpdateUserProjectsCalls.count - 1
+        }
+        if callIndex == 0 { await firstUpdateUserProjectsGate?.wait() }
+        if updateUserProjectsResults.indices.contains(callIndex) {
+            return updateUserProjectsResults[callIndex]
+        }
         return updateUserProjectsResult ?? .success(UserProjects(projects: projectNames, activeProject: projectNames.first ?? ""))
     }
     func updateActiveProject(_ projectName: String) async -> AppResult<UserProjects> {
@@ -71,8 +87,43 @@ final class FakeProjectRepository: ProjectRepository, @unchecked Sendable {
 final class SpyOrchestrator: OrchestratorRunning, @unchecked Sendable {
     private let lock = NSLock()
     private var calls: [OrchestratorTrigger] = []
+    private var accuracyRetryInvalidations = 0
+    private var accepted: [(String, String, CheckAction, HistoryState)] = []
+    private var confirmed: [(String, HistoryState)] = []
+    private var pendingRunGate: AsyncGate?
     var runOnceCalls: [OrchestratorTrigger] { lock.withLock { calls } }
-    func runOnce(_ trigger: OrchestratorTrigger) async { lock.withLock { calls.append(trigger) } }
+    var invalidateAccuracyRetryCount: Int { lock.withLock { accuracyRetryInvalidations } }
+    var acceptedChecks: [(String, String, CheckAction, HistoryState)] { lock.withLock { accepted } }
+    var confirmedStates: [(String, HistoryState)] { lock.withLock { confirmed } }
+    var nextRunGate: AsyncGate? {
+        get { lock.withLock { pendingRunGate } }
+        set { lock.withLock { pendingRunGate = newValue } }
+    }
+    func runOnce(_ trigger: OrchestratorTrigger) async {
+        let gate = lock.withLock { () -> AsyncGate? in
+            calls.append(trigger)
+            defer { pendingRunGate = nil }
+            return pendingRunGate
+        }
+        await gate?.wait()
+    }
+    func invalidateAccuracyRetry() async {
+        lock.withLock { accuracyRetryInvalidations += 1 }
+    }
+    func acceptedCheck(
+        chave: String,
+        project: String,
+        action: CheckAction,
+        newState: HistoryState
+    ) async {
+        lock.withLock {
+            accuracyRetryInvalidations += 1
+            accepted.append((chave, project, action, newState))
+        }
+    }
+    func confirmedState(chave: String, newState: HistoryState) async {
+        lock.withLock { confirmed.append((chave, newState)) }
+    }
 }
 
 final class SpySecurePasswordStore: SecurePasswordStore, @unchecked Sendable {

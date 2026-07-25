@@ -62,6 +62,12 @@ final class ProjectDTOCodingTests: XCTestCase {
         XCTAssertEqual(r.activeProject, "P80")
     }
 
+    func test_webUserProjectsResponse_acceptsNoMemberships() throws {
+        let r = try decode(WebUserProjectsResponse.self, #"{"projects":[],"active_project":""}"#)
+        XCTAssertEqual(r.projects, [])
+        XCTAssertEqual(r.activeProject, "")
+    }
+
     func test_webUserProjectsUpdateResponse_snake_case() throws {
         let r = try decode(WebUserProjectsUpdateResponse.self, #"{"projects":["P80"],"active_project":"P80","ok":true,"message":"ok"}"#)
         XCTAssertEqual(r.activeProject, "P80")
@@ -77,6 +83,11 @@ final class ProjectDTOCodingTests: XCTestCase {
     func test_userProjectsUpdateRequest_encodes_projects_array() throws {
         let obj = try encodeToObject(WebUserProjectsUpdateRequest(projects: ["P80", "P81"]))
         XCTAssertEqual(obj["projects"] as? [String], ["P80", "P81"])
+    }
+
+    func test_userProjectsUpdateRequest_encodesEmptyProjectsArray() throws {
+        let obj = try encodeToObject(WebUserProjectsUpdateRequest(projects: []))
+        XCTAssertEqual(obj["projects"] as? [String], [])
     }
 
     func test_projectUpdateRequest_encodes_project_field() throws {

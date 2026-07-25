@@ -90,6 +90,7 @@ struct CheckUiState: Sendable, Equatable {
     var selectedManualLocation: String?
     var userProjects: UserProjects?
     var isProjectsLoading = false
+    var isProjectMembershipSyncing = false
     var mainProjectCatalog: [Project] = []
     var isLocationLoading = false
     var locationPermissionSufficient = false
@@ -110,7 +111,7 @@ struct CheckUiState: Sendable, Equatable {
     var requiresManualLocation: Bool { !automaticActivitiesEnabled || isAccuracyTooLow }
 
     var canSubmit: Bool {
-        guard isAuthenticated && !isSubmitting else { return false }
+        guard isAuthenticated && !isSubmitting && !isProjectMembershipSyncing else { return false }
         if !requiresManualLocation { return locationMatch != nil }
         if selectedAction == .checkOut { return true }
         return selectedManualLocation != nil

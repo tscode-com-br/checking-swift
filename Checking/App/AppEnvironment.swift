@@ -22,6 +22,7 @@ public struct AppEnvironment: Sendable {
     let projectRepository: any ProjectRepository        // catálogo + projetos do usuário; satisfaz o seam do CheckViewModel
     let captureLocationUseCase: any LocationCapturing   // captura+match compartilhados por UI e motor automático
     let orchestrator: BackgroundCheckOrchestrator       // actor — os 7 passos; localização real (CLLocationManager)
+    let appRefreshScheduler: any AppRefreshScheduling   // único BGAppRefresh: regular + precisão + pausa
     let geofenceRegionManager: GeofenceRegionManager    // arma/reconcilia geofences (cap 20 + priorização)
     let significantLocationMonitor: any SignificantLocationMonitoring // fallback de movimento amplo (§9.3)
     let permissionsInspector: any PermissionsInspecting // lê o estado vivo de permissões (escada + painel)
@@ -42,7 +43,8 @@ public struct AppEnvironment: Sendable {
          accidentRepository: any AccidentRepository, accidentVideoUploader: BackgroundAccidentVideoUploader? = nil,
          projectRepository: any ProjectRepository,
          captureLocationUseCase: any LocationCapturing,
-         orchestrator: BackgroundCheckOrchestrator, geofenceRegionManager: GeofenceRegionManager,
+         orchestrator: BackgroundCheckOrchestrator, appRefreshScheduler: any AppRefreshScheduling,
+         geofenceRegionManager: GeofenceRegionManager,
          significantLocationMonitor: any SignificantLocationMonitoring,
          permissionsInspector: any PermissionsInspecting, settingsOpener: any SettingsOpening) {
         self.clock = clock
@@ -63,6 +65,7 @@ public struct AppEnvironment: Sendable {
         self.projectRepository = projectRepository
         self.captureLocationUseCase = captureLocationUseCase
         self.orchestrator = orchestrator
+        self.appRefreshScheduler = appRefreshScheduler
         self.geofenceRegionManager = geofenceRegionManager
         self.significantLocationMonitor = significantLocationMonitor
         self.permissionsInspector = permissionsInspector
@@ -84,9 +87,6 @@ public struct AppEnvironment: Sendable {
         let syncScheduler = BGTaskSyncScheduler()
         let offlineQueue = OfflineCheckQueue(store: EncryptedOfflineQueueStore(), scheduler: syncScheduler)
         let networkMonitor = NWPathMonitorNetworkMonitor()
-        let replayer = PendingCheckReplayer(queue: offlineQueue, repository: checkRepository, logger: activityLogger)
-        let offlineSyncCoordinator = OfflineSyncCoordinator(replayer: replayer, monitor: networkMonitor)
-        syncScheduler.setDrainTrigger { [offlineSyncCoordinator] in Task { await offlineSyncCoordinator.triggerDrain() } }
         // SSE ao vivo compartilhado: reconexão sobre URLSession.bytes, re-chaveada por chave.
         let sseConnection = URLSessionSSEConnection(xClient: apiConfig.xClient, cookieStore: cookieStore)
         let checkEventStream = CheckEventStream(makeStream: { [apiConfig, sseConnection, networkMonitor] chave in
@@ -117,6 +117,7 @@ public struct AppEnvironment: Sendable {
         // (CLLocationManager "15s melhor-fix"). Geofence region-monitoring segue no slice de localização/permissões.
         let notifications = AutoActivityNotificationsLive()
         let pauseAlarms = LocalNotificationPauseAlarmScheduler()
+        let appRefreshScheduler = BGTaskAppRefreshScheduler()
         let locationProvider = CLLocationManagerLocationProvider()
         let captureLocationBase = CaptureLocationUseCase(
             locationProvider: locationProvider,
@@ -134,7 +135,17 @@ public struct AppEnvironment: Sendable {
             securePasswordStore: securePasswordStore, accidentRepository: accidentRepository,
             activityLogger: activityLogger, notifications: notifications,
             backgroundTaskGuard: UIKitBackgroundTaskGuard(),
-            pauseAlarms: pauseAlarms)
+            pauseAlarms: pauseAlarms,
+            appRefreshScheduler: appRefreshScheduler)
+        let replayer = PendingCheckReplayer(
+            queue: offlineQueue,
+            repository: checkRepository,
+            logger: activityLogger,
+            acceptedCheckObserver: orchestrator)
+        let offlineSyncCoordinator = OfflineSyncCoordinator(replayer: replayer, monitor: networkMonitor)
+        syncScheduler.setDrainTrigger {
+            [offlineSyncCoordinator] in Task { await offlineSyncCoordinator.triggerDrain() }
+        }
         // Geofence region-monitoring: o monitor real acorda o orquestrador (`runOnce(.geofence)`) em cada
         // travessia; o manager busca/prioriza/arma (cap 20). Registro real dispara no foreground/login (Camada
         // D) quando a UI existir — o gatilho já está pronto para plugar.
@@ -161,7 +172,8 @@ public struct AppEnvironment: Sendable {
                               accidentRepository: accidentRepository, accidentVideoUploader: accidentVideoUploader,
                               projectRepository: projectRepository,
                               captureLocationUseCase: captureLocation,
-                              orchestrator: orchestrator, geofenceRegionManager: geofenceRegionManager,
+                              orchestrator: orchestrator, appRefreshScheduler: appRefreshScheduler,
+                              geofenceRegionManager: geofenceRegionManager,
                               significantLocationMonitor: significantLocationMonitor,
                               permissionsInspector: PermissionsInspectorLive(), settingsOpener: UIKitSettingsOpener())
     }
@@ -174,7 +186,6 @@ public struct AppEnvironment: Sendable {
         let activityLog = ActivityLog(dao: CoreDataActivityLogDao(stack: CoreDataStack(inMemory: true)))
         let activityLogger = ActivityLogger(clock: SystemClock(), activityLog: activityLog)
         let monitor = StaticNetworkMonitor(online: true)
-        let replayer = PendingCheckReplayer(queue: offlineQueue, repository: checkRepository, logger: activityLogger)
         let previewPrefsSuite = "br.com.tscode.checking.preview.\(UUID().uuidString)"
         let previewPrefs = UserDefaultsPreferencesStore(defaults: UserDefaults(suiteName: previewPrefsSuite) ?? .standard)
         let previewSecurePasswordStore = InMemorySecurePasswordStore()
@@ -192,6 +203,11 @@ public struct AppEnvironment: Sendable {
             locationProvider: locationProvider, clock: previewClock, authRepository: previewAuthRepository,
             securePasswordStore: previewSecurePasswordStore, accidentRepository: previewAccidentRepository,
             activityLogger: activityLogger, notifications: PreviewAutoActivityNotifications())
+        let replayer = PendingCheckReplayer(
+            queue: offlineQueue,
+            repository: checkRepository,
+            logger: activityLogger,
+            acceptedCheckObserver: orchestrator)
         let geofenceRegionManager = GeofenceRegionManager(
             checkRepository: checkRepository, monitor: NoopGeofenceRegionMonitor(), activityLogger: activityLogger)
         return AppEnvironment(
@@ -207,7 +223,8 @@ public struct AppEnvironment: Sendable {
             accidentRepository: previewAccidentRepository,
             projectRepository: PreviewProjectRepository(),
             captureLocationUseCase: captureLocation,
-            orchestrator: orchestrator, geofenceRegionManager: geofenceRegionManager,
+            orchestrator: orchestrator, appRefreshScheduler: NoopAppRefreshScheduler(),
+            geofenceRegionManager: geofenceRegionManager,
             significantLocationMonitor: NoopSignificantLocationMonitor(),
             permissionsInspector: PreviewPermissionsInspector(), settingsOpener: PreviewSettingsOpener())
     }()
@@ -288,6 +305,8 @@ private struct PreviewAutoActivityNotifications: AutoActivityNotifying {
     func postActivityNotification(action: CheckAction, local: String?, lang: String) {}
     func postReauthNotification(lang: String) {}
     func postScheduledPauseTransition(started: Bool, lang: String) {}
+    func postLowAccuracyNotification(expectedAction: CheckAction?, lang: String) async {}
+    func clearLowAccuracyNotification() async {}
 }
 
 /// Inspector de permissões inerte para SwiftUI previews (não lê o estado real do sistema). Reporta um cenário

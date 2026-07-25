@@ -14,6 +14,12 @@ protocol AppPreferencesReading: Sendable {
     func setSeenAccidentIds(_ ids: Set<Int>) async
     func getFlag(_ name: String) async -> Bool
     func setFlag(_ name: String, _ value: Bool) async
+    /// Episódio durável de retry por baixa precisão. String vazia representa ausência.
+    func accuracyRetryEpisodeJson() async -> String
+    func setAccuracyRetryEpisodeJson(_ json: String) async
+    /// Adiamento durável da Pausa Programada. String vazia representa ausência.
+    func scheduledPauseDeferralJson() async -> String
+    func setScheduledPauseDeferralJson(_ json: String) async
 }
 
 /// Auth — só o `login` do relogin silencioso (o slice de auth traz a interface completa).
@@ -38,6 +44,8 @@ protocol AutoActivityNotifying: Sendable {
     func postActivityNotification(action: CheckAction, local: String?, lang: String)
     func postReauthNotification(lang: String)
     func postScheduledPauseTransition(started: Bool, lang: String)
+    func postLowAccuracyNotification(expectedAction: CheckAction?, lang: String) async
+    func clearLowAccuracyNotification() async
 }
 
 /// "Wake lock" iOS = `beginBackgroundTask` (prazo do sistema; §9). No-op nos testes; release preservado no `defer`.
@@ -62,6 +70,36 @@ struct NoopPauseAlarmScheduling: PauseAlarmScheduling {
     func scheduleResume(at: Date?, notify: Bool, lang: String) async {}
     func scheduleStart(at: Date?, notify: Bool, lang: String) async {}
     func consumeScheduledTransition(started: Bool, dueAtOrBefore now: Date) async -> Bool { false }
+}
+
+/// Único scheduler de `BGAppRefresh` do app. Os prazos persistidos participam do mesmo request regular:
+/// o próximo despertar é `min(retry de precisão, transição bruta, grace da pausa, agora + 15min)`.
+protocol AppRefreshScheduling: Sendable {
+    @discardableResult
+    func scheduleRegularRefresh() -> String?
+    @discardableResult
+    func scheduleAccuracyRetry(at deadline: Date) -> String?
+    @discardableResult
+    func clearAccuracyRetryDeadlineAndScheduleRegular() -> String?
+    @discardableResult
+    func schedulePauseActivation(at deadline: Date) -> String?
+    @discardableResult
+    func clearPauseActivationDeadlineAndScheduleRegular() -> String?
+    @discardableResult
+    func schedulePauseTransition(at deadline: Date) -> String?
+    @discardableResult
+    func clearPauseTransitionDeadlineAndScheduleRegular() -> String?
+    func triggerForPendingRefresh() -> OrchestratorTrigger
+}
+struct NoopAppRefreshScheduler: AppRefreshScheduling {
+    func scheduleRegularRefresh() -> String? { nil }
+    func scheduleAccuracyRetry(at deadline: Date) -> String? { nil }
+    func clearAccuracyRetryDeadlineAndScheduleRegular() -> String? { nil }
+    func schedulePauseActivation(at deadline: Date) -> String? { nil }
+    func clearPauseActivationDeadlineAndScheduleRegular() -> String? { nil }
+    func schedulePauseTransition(at deadline: Date) -> String? { nil }
+    func clearPauseTransitionDeadlineAndScheduleRegular() -> String? { nil }
+    func triggerForPendingRefresh() -> OrchestratorTrigger { .timer }
 }
 
 /// Contrato do motor automático (permite fakear o use-case nos testes do orquestrador).

@@ -63,7 +63,7 @@ private let ptStrings: [String: String] = [
     "projects.loadingProjects": "Carregando projetos...",
     "projects.noneAvailableShort": "Nenhum projeto disponível",
     "projects.noneAvailableSentence": "Nenhum projeto disponível.",
-    "projects.noActiveProject": "Nenhum projeto ativo selecionado.",
+    "projects.noActiveProject": "O usuário não está cadastrado em nenhum projeto.",
     "passwordDialog.titleChange": "Alterar Senha",
     "passwordDialog.titleRegister": "Cadastrar Senha",
     "passwordDialog.oldPasswordLabel": "Senha Antiga",
@@ -212,6 +212,10 @@ private let ptStrings: [String: String] = [
     "autoActivities.notification.accidentMessage": "Checking: acidente reportado!",
     "autoActivities.notification.reauthTitle": "Checking — Reautenticação necessária",
     "autoActivities.notification.reauthBody": "Abra o aplicativo para entrar novamente.",
+    "autoActivities.notification.lowAccuracyCheckinTitle": "Check-in - Falha!",
+    "autoActivities.notification.lowAccuracyCheckoutTitle": "Check-out - Falha!",
+    "autoActivities.notification.lowAccuracyGenericTitle": "Atividade automática - Falha!",
+    "autoActivities.notification.lowAccuracyBody": "Baixa Precisão. Tentará novamente.",
 ]
 
 let defaultLanguageCode = "pt"

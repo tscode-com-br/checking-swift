@@ -10,8 +10,30 @@ extension UNUserNotificationCenter: NotificationRequestPosting {}
 
 protocol ScheduledNotificationCenter: NotificationRequestPosting {
     func removePendingNotificationRequests(withIdentifiers identifiers: [String])
+    func removeDeliveredNotifications(withIdentifiers identifiers: [String])
 }
 extension UNUserNotificationCenter: ScheduledNotificationCenter {}
+
+private actor PauseNotificationOperationLock {
+    private var isLocked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if !isLocked {
+            isLocked = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            isLocked = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
 
 /// Agenda as mensagens de início/fim da pausa no próprio sistema. Isso dá pontualidade à informação
 /// mesmo quando o processo está suspenso; não promete execução de código no horário (restrição do iOS).
@@ -23,6 +45,7 @@ final class LocalNotificationPauseAlarmScheduler: PauseAlarmScheduling, @uncheck
 
     private let center: any ScheduledNotificationCenter
     private let defaults: UserDefaults
+    private let operationLock = PauseNotificationOperationLock()
 
     init(
         center: any ScheduledNotificationCenter = UNUserNotificationCenter.current(),
@@ -33,20 +56,27 @@ final class LocalNotificationPauseAlarmScheduler: PauseAlarmScheduling, @uncheck
     }
 
     func scheduleResume(at: Date?, notify: Bool, lang: String) async {
+        await operationLock.acquire()
         await schedule(started: false, at: at, notify: notify, lang: lang)
+        await operationLock.release()
     }
 
     func scheduleStart(at: Date?, notify: Bool, lang: String) async {
+        await operationLock.acquire()
         await schedule(started: true, at: at, notify: notify, lang: lang)
+        await operationLock.release()
     }
 
     func consumeScheduledTransition(started: Bool, dueAtOrBefore now: Date) async -> Bool {
+        await operationLock.acquire()
         let key = started ? Self.startDateKey : Self.resumeDateKey
         let timestamp = defaults.double(forKey: key)
-        guard timestamp > 0, timestamp <= now.timeIntervalSince1970 else { return false }
+        guard timestamp > 0, timestamp <= now.timeIntervalSince1970 else {
+            await operationLock.release()
+            return false
+        }
         defaults.removeObject(forKey: key)
-        center.removePendingNotificationRequests(
-            withIdentifiers: [started ? Self.startIdentifier : Self.resumeIdentifier])
+        await operationLock.release()
         return true
     }
 
@@ -54,6 +84,7 @@ final class LocalNotificationPauseAlarmScheduler: PauseAlarmScheduling, @uncheck
         let identifier = started ? Self.startIdentifier : Self.resumeIdentifier
         let key = started ? Self.startDateKey : Self.resumeDateKey
         center.removePendingNotificationRequests(withIdentifiers: [identifier])
+        center.removeDeliveredNotifications(withIdentifiers: [identifier])
         defaults.removeObject(forKey: key)
 
         guard notify, let date, date.timeIntervalSinceNow > 0 else { return }
@@ -102,9 +133,10 @@ final class LocalNotificationPauseAlarmScheduler: PauseAlarmScheduling, @uncheck
 /// sem `POST_NOTIFICATIONS` também não propaga erro ao chamador. Solicitar a permissão em si é do
 /// slice de permissões (`port_spec_permissions_diagnostics §7`), não deste.
 struct AutoActivityNotificationsLive: AutoActivityNotifying {
-    private let center: any NotificationRequestPosting
+    private static let lowAccuracyIdentifier = "autoActivities.lowAccuracy"
+    private let center: any ScheduledNotificationCenter
 
-    init(center: any NotificationRequestPosting = UNUserNotificationCenter.current()) {
+    init(center: any ScheduledNotificationCenter = UNUserNotificationCenter.current()) {
         self.center = center
     }
 
@@ -140,6 +172,31 @@ struct AutoActivityNotificationsLive: AutoActivityNotifying {
             ? t("autoActivities.notification.pauseStartMessage", lang: lang)
             : t("autoActivities.notification.pauseEndMessage", lang: lang)
         postSimpleEvent(identifier: "autoActivities.pause", message: message, lang: lang)
+    }
+
+    func postLowAccuracyNotification(expectedAction: CheckAction?, lang: String) async {
+        let titleKey: String
+        switch expectedAction {
+        case .checkIn: titleKey = "autoActivities.notification.lowAccuracyCheckinTitle"
+        case .checkOut: titleKey = "autoActivities.notification.lowAccuracyCheckoutTitle"
+        case nil: titleKey = "autoActivities.notification.lowAccuracyGenericTitle"
+        }
+        let content = UNMutableNotificationContent()
+        content.title = t(titleKey, lang: lang)
+        content.body = t("autoActivities.notification.lowAccuracyBody", lang: lang)
+        content.sound = .default
+        content.userInfo = ["checking_event": "low_accuracy"]
+        let request = UNNotificationRequest(
+            identifier: Self.lowAccuracyIdentifier,
+            content: content,
+            trigger: nil)
+        try? await center.add(request)
+    }
+
+    func clearLowAccuracyNotification() async {
+        let identifiers = [Self.lowAccuracyIdentifier]
+        center.removePendingNotificationRequests(withIdentifiers: identifiers)
+        center.removeDeliveredNotifications(withIdentifiers: identifiers)
     }
 
     // Builder compartilhado das notificações simples "marca + mensagem" — port de postSimpleEvent.

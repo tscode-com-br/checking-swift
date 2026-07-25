@@ -104,4 +104,41 @@ final class ScheduledPauseTests: XCTestCase {
     func test_resume_both_weekend_plus_wrap_window() {
         XCTAssertEqual(resume("2024-01-13T02:00:00Z", settings(enabled: true, from: "22:00", to: "06:00", suspendSat: true, suspendSun: true)), iso("2024-01-15T06:00:00Z"))
     }
+
+    // ── identidade persistível da ocorrência [start, end) ──
+    func test_currentWindow_wrapMidnight_hasStablePreviousDayStart() {
+        let s = settings(enabled: true, from: "22:00", to: "06:00")
+        let first = currentScheduledPauseWindow(iso("2024-01-16T00:30:00Z"), cal, s)
+        let second = currentScheduledPauseWindow(iso("2024-01-16T05:59:00Z"), cal, s)
+
+        XCTAssertEqual(first?.start, iso("2024-01-15T22:00:00Z"))
+        XCTAssertEqual(first?.end, iso("2024-01-16T06:00:00Z"))
+        XCTAssertEqual(first, second)
+    }
+
+    func test_currentWindow_weekendOverlap_isOneContinuousOccurrence() {
+        let s = settings(
+            enabled: true,
+            from: "22:00",
+            to: "06:00",
+            suspendSat: true,
+            suspendSun: true)
+        let window = currentScheduledPauseWindow(iso("2024-01-14T12:00:00Z"), cal, s)
+
+        XCTAssertEqual(window?.start, iso("2024-01-12T22:00:00Z"))
+        XCTAssertEqual(window?.end, iso("2024-01-15T06:00:00Z"))
+    }
+
+    func test_currentWindow_isStableAcrossSpringDSTGap() {
+        var newYork = Calendar(identifier: .gregorian)
+        newYork.locale = Locale(identifier: "en_US_POSIX")
+        newYork.timeZone = TimeZone(identifier: "America/New_York")!
+        let s = settings(enabled: true, from: "01:30", to: "04:00")
+        let first = currentScheduledPauseWindow(iso("2024-03-10T07:05:00Z"), newYork, s)
+        let second = currentScheduledPauseWindow(iso("2024-03-10T07:55:00Z"), newYork, s)
+
+        XCTAssertEqual(first?.start, iso("2024-03-10T06:30:00Z"))
+        XCTAssertEqual(first?.end, iso("2024-03-10T08:00:00Z"))
+        XCTAssertEqual(first, second)
+    }
 }

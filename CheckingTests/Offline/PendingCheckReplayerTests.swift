@@ -28,11 +28,22 @@ final class PendingCheckReplayerTests: XCTestCase {
     }
     private let options = LocationOptions(items: ["Unidade P80"], accuracyThresholdMeters: 50, mixedZoneIntervalMinutes: 15)
 
-    private func fixture(_ events: [PendingCheckEvent]) -> (PendingCheckReplayer, FakePendingCheckQueue, ReplaySpyRepository, RecordingActivityLogger) {
+    private func fixture(
+        _ events: [PendingCheckEvent],
+        observer: (any OrchestratorRunning)? = nil
+    ) -> (PendingCheckReplayer, FakePendingCheckQueue, ReplaySpyRepository, RecordingActivityLogger) {
         let queue = FakePendingCheckQueue(events)
         let spy = ReplaySpyRepository()
         let logger = RecordingActivityLogger()
-        return (PendingCheckReplayer(queue: queue, repository: spy, logger: logger), queue, spy, logger)
+        return (
+            PendingCheckReplayer(
+                queue: queue,
+                repository: spy,
+                logger: logger,
+                acceptedCheckObserver: observer),
+            queue,
+            spy,
+            logger)
     }
 
     func test_decided_replays_verbatim_with_original_time_and_id() async {
@@ -151,5 +162,35 @@ final class PendingCheckReplayerTests: XCTestCase {
         let fillByEvent = Dictionary(uniqueKeysWithValues: spy.submitCalls.map { ($0.clientEventId, $0.fillForms) })
         XCTAssertEqual(fillByEvent["stale"], false)     // >24h antes do mais novo → sem FORMS
         XCTAssertEqual(fillByEvent["recent"], true)     // o mais novo → FORMS
+    }
+
+    func test_notifiesOnlyFinalConfirmedState_afterWholeDrainCompletes() async {
+        let observer = SpyOrchestrator()
+        let (replayer, _, spy, _) = fixture([
+            decided("first", at: 1_000, action: "checkout"),
+            decided("last", at: 2_000, action: "checkin"),
+        ], observer: observer)
+        // Mesmo que o último payload seja check-in retroativo, o estado final autoritativo continua checkout.
+        spy.submitResult = .success(state(.checkOut))
+
+        let result = await replayer.drain()
+
+        XCTAssertEqual(result, .completed)
+        XCTAssertEqual(observer.acceptedChecks.count, 1)
+        XCTAssertEqual(observer.acceptedChecks.first?.2, .checkIn)
+        XCTAssertEqual(resolveLastRecordedAction(observer.acceptedChecks.first?.3), .checkOut)
+    }
+
+    func test_retryDoesNotNotifyAcceptedStateBeforeDrainCompletes() async {
+        let observer = SpyOrchestrator()
+        let (replayer, _, spy, _) = fixture(
+            [decided("retry", at: 1_000, action: "checkout")],
+            observer: observer)
+        spy.submitResult = .failure(.network)
+
+        let result = await replayer.drain()
+
+        XCTAssertEqual(result, .retry)
+        XCTAssertTrue(observer.acceptedChecks.isEmpty)
     }
 }

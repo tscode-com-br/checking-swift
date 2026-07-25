@@ -16,11 +16,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 #endif
 
     /// Devem casar com `BGTaskSchedulerPermittedIdentifiers` no Info.plist.
-    static let refreshTaskID = "br.com.tscode.checking.refresh"
+    static let refreshTaskID = BGTaskAppRefreshScheduler.taskIdentifier
     static let processingTaskID = BGTaskSyncScheduler.taskIdentifier   // "…​.processing"
-    /// `TIMER_INTERVAL_MS=15min` do FGS Android (port_spec_background_orchestrator §11) — preferência de
-    /// `earliestBeginDate`; o iOS NÃO garante essa cadência (best-effort, §9 "Sem tick garantido").
-    static let refreshIntervalSeconds: TimeInterval = 15 * 60
     private var pendingAccidentNotificationOpen = false
     private var accidentNotificationRouteTask: Task<Void, Never>?
 
@@ -45,7 +42,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             }
         }
         let backgroundTaskRegistrations = registerBackgroundTasks()
-        let refreshSubmissionError = Self.scheduleAppRefresh()
+        let refreshSubmissionError = environment.appRefreshScheduler.scheduleRegularRefresh()
         // 1ª submissão — sem isso o handler registrado acima nunca é chamado pelo iOS.
         Task { await environment.offlineSyncCoordinator.start() }   // observa reconexão (NWPathMonitor) → drena
         AppLog.lifecycle.info("App started.") // espelha CheckingApp.onCreate → logSystem("App started.")
@@ -113,24 +110,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 #endif
     }
 
-    // `register(forTaskWithIdentifier:)` só instala o handler — não agenda nada sozinho. Precisa de um
-    // `submit` (aqui + no fim de cada execução, conversion_plan.md §9.6 "reagendar no início ou final").
-    // `static`: não usa estado de instância — evita capturar `self` (não-Sendable) dentro do `Task` fire-and-forget.
-    @discardableResult
-    private static func scheduleAppRefresh() -> String? {
-        let request = BGAppRefreshTaskRequest(identifier: Self.refreshTaskID)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: Self.refreshIntervalSeconds)
-        do {
-            try BGTaskScheduler.shared.submit(request)
-            return nil
-        } catch {
-            return String(describing: error)
-        }
-    }
-
     private func registerBackgroundTasks() -> (refresh: Bool, processing: Bool) {
         // Reconciliação curta oportunista — equivalente ao timer 15min do FGS Android (§9, "Sem tick garantido").
         let orchestrator = environment.orchestrator
+        let refreshScheduler = environment.appRefreshScheduler
         let refreshRegistered = BGTaskScheduler.shared.register(
             forTaskWithIdentifier: Self.refreshTaskID,
             // `AppDelegate` e este handler são isolados na MainActor. Se o sistema escolher sua fila
@@ -145,8 +128,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                     await BackgroundValidationRecorder.shared.record("bg_app_refresh_started")
                 }
 #endif
-                await orchestrator.runOnce(.timer)
-                Self.scheduleAppRefresh()   // reagenda no fim da execução — sem isso só dispara 1×
+                let trigger = refreshScheduler.triggerForPendingRefresh()
+                await orchestrator.runOnce(trigger)
+                // Reagendar "regular" preserva os deadlines persistidos de precisão e pausa no mesmo request.
+                refreshScheduler.scheduleRegularRefresh()
 #if DEBUG
                 if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
                     await BackgroundValidationRecorder.shared.record("bg_app_refresh_completed")

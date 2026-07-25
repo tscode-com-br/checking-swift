@@ -33,6 +33,11 @@ final class CheckViewModel {
     private var checkSseTask: Task<Void, Never>?
     private var settingsPersistenceTask: Task<Void, Never>?
     private var settingsReconciliationTask: Task<Void, Never>?
+    private var projectMembershipSyncTask: Task<Void, Never>?
+    private var pendingProjectMemberships: [String]?
+    private var authoritativeUserProjects: UserProjects?
+    private var projectMembershipSyncGeneration = 0
+    private var projectMembershipLoadGeneration = 0
     private var activityLoadGeneration = 0
     // Sem `deinit`: `deinit` de uma classe `@MainActor` roda nonisolated (Swift 6) e não pode acessar estas
     // propriedades isoladas. Em vez disso, `startPendingApprovalPolling`/`startCheckStream` capturam `[weak self]`
@@ -104,10 +109,15 @@ final class CheckViewModel {
 
     func onChaveChanged(_ rawValue: String) {
         let sanitized = sanitizeSettingsChave(rawValue)
+        let previousChave = uiState.chave
+        if previousChave.count == 4, previousChave != sanitized {
+            Task { await orchestrator.invalidateAutomationContext() }
+        }
         chaveTask?.cancel()                                      // aborta o fluxo de probe/login da chave anterior
         passwordVerifyTask?.cancel()
         stopPendingApprovalPolling()
         stopCheckStream()
+        resetProjectMembershipSync()
 
         uiState.chave = sanitized
         uiState.password = ""
@@ -130,6 +140,7 @@ final class CheckViewModel {
         uiState.mainProjectCatalog = []
         uiState.availableLocations = []
         uiState.isProjectsLoading = false
+        uiState.isProjectMembershipSyncing = false
         uiState.isLocationLoading = false
         uiState.selectedManualLocation = nil
         uiState.locationMatch = nil
@@ -315,7 +326,6 @@ final class CheckViewModel {
         }
         Task { await loadUserProjects(chave: chave) }
         Task { await loadMainProjectCatalog(chave: chave) }
-        Task { await loadAvailableLocations(chave: chave) }
         Task { await refreshPermissionState(captureIfEligible: true) }
         startCheckStream(chave)
     }
@@ -437,14 +447,18 @@ final class CheckViewModel {
         }
         if uiState.isAuthenticated {
             refreshCheckState()
-            if uiState.automaticActivitiesEnabled {
-                Task {
-                    await reconcileAutomaticLocationServices()
+            let chave = uiState.chave
+            Task {
+                // A API é a fonte de verdade. Isso elimina memberships locais obsoletas antes de
+                // avaliar qualquer check-in/out automático no retorno ao primeiro plano.
+                await loadUserProjects(chave: chave)
+                guard uiState.chave == chave, uiState.isAuthenticated,
+                      !uiState.isProjectMembershipSyncing else { return }
+                if uiState.automaticActivitiesEnabled,
+                   let activeProject = uiState.userProjects?.activeProject,
+                   !activeProject.isEmpty {
                     await refreshPermissionState(captureIfEligible: true)
-                    await orchestrator.runOnce(.foreground)
                 }
-            } else {
-                Task { await reconcileAutomaticLocationServices() }
             }
         }
     }
@@ -455,42 +469,114 @@ final class CheckViewModel {
     func setAutomaticActivitiesEnabled(_ enabled: Bool) async -> Bool {
         let chave = uiState.chave
         guard chave.count == 4, uiState.isAuthenticated else { return false }
-
-        var rawMap = (try? JSONCoding.decoder.decode(
-            [String: UserSettings].self,
-            from: Data((await appPreferences.userSettingsJson()).utf8)
-        )) ?? [:]
-        var settings = resolvePersistedUserSettings(rawMap, chave)
+        let membershipLoadGeneration = projectMembershipLoadGeneration
+        var refreshedProjects: UserProjects?
 
         if enabled {
+            guard !uiState.isProjectsLoading, !uiState.isProjectMembershipSyncing else { return false }
             switch await projectRepository.getUserProjects() {
             case .success(let userProjects):
-                guard !userProjects.projects.isEmpty else { return false }
-                settings.projects = userProjects.projects
-                settings.activeProject = userProjects.projects.contains(userProjects.activeProject)
+                guard uiState.chave == chave, uiState.isAuthenticated,
+                      !uiState.isProjectMembershipSyncing,
+                      membershipLoadGeneration == projectMembershipLoadGeneration else { return false }
+                authoritativeUserProjects = userProjects
+                uiState.userProjects = userProjects
+                guard !userProjects.projects.isEmpty else {
+                    let persistence = enqueueSettingsUpdate { settings in
+                        settings.projects = []
+                        settings.activeProject = ""
+                        settings.automaticActivitiesEnabled = false
+                    }
+                    await persistence.value
+                    guard uiState.chave == chave, uiState.isAuthenticated else { return false }
+                    let persistedSettings = await loadUserSettings(chave)
+                    guard uiState.chave == chave, uiState.isAuthenticated else { return false }
+                    applySettings(persistedSettings)
+                    await orchestrator.invalidateAutomationContext()
+                    guard uiState.chave == chave, uiState.isAuthenticated else { return false }
+                    uiState.availableLocations = []
+                    uiState.selectedManualLocation = nil
+                    showNoProjectNotification()
+                    await reconcileAutomaticLocationServices()
+                    return false
+                }
+                let activeProject = userProjects.projects.contains(userProjects.activeProject)
                     ? userProjects.activeProject
                     : userProjects.projects[0]
-                uiState.userProjects = UserProjects(
+                let normalizedProjects = UserProjects(
                     projects: userProjects.projects,
-                    activeProject: settings.activeProject
-                )
+                    activeProject: activeProject)
+                refreshedProjects = normalizedProjects
+                uiState.userProjects = normalizedProjects
+                updateNoProjectNotification(for: normalizedProjects)
             case .failure(let error):
                 if case .unauthorized = error { handleAuthExpiry() }
                 return false
             }
         }
 
-        settings.automaticActivitiesEnabled = enabled
-        rawMap = withPersistedUserSettings(rawMap, chave, settings)
-        guard let encoded = try? JSONCoding.encoder.encode(rawMap),
-              let json = String(data: encoded, encoding: .utf8) else { return false }
-        await appPreferences.setUserSettingsJson(json)
-        applySettings(settings)
+        let projectsForPersistence = refreshedProjects
+        let persistence = enqueueSettingsUpdate { settings in
+            if let projectsForPersistence {
+                settings.projects = projectsForPersistence.projects
+                settings.activeProject = projectsForPersistence.activeProject
+            }
+            settings.automaticActivitiesEnabled = enabled
+        }
+        await persistence.value
+        guard uiState.chave == chave, uiState.isAuthenticated else { return false }
+
+        var stableProjects: UserProjects?
+        if enabled {
+            guard await waitForProjectMembershipStability(chave: chave),
+                  let currentProjects = uiState.userProjects else { return false }
+            stableProjects = currentProjects
+
+            // Se uma checkbox mudou durante a persistência acima, restaura nas preferências o estado
+            // final confirmado pelo worker antes de permitir que o orquestrador execute.
+            let correction = enqueueSettingsUpdate { settings in
+                settings.projects = currentProjects.projects
+                settings.activeProject = currentProjects.activeProject
+                if currentProjects.projects.isEmpty || currentProjects.activeProject.isEmpty {
+                    settings.automaticActivitiesEnabled = false
+                }
+            }
+            await correction.value
+            guard await waitForProjectMembershipStability(chave: chave) else { return false }
+            guard uiState.userProjects == currentProjects else {
+                return await setAutomaticActivitiesEnabled(true)
+            }
+        }
+
+        let persistedSettings = await loadUserSettings(chave)
+        guard uiState.chave == chave, uiState.isAuthenticated else { return false }
+        applySettings(persistedSettings)
+        if !enabled {
+            // Somente depois de OFF estar durável: invalida qualquer captura automática que atravessou await.
+            await orchestrator.invalidateAutomationContext()
+            guard uiState.chave == chave, uiState.isAuthenticated else { return false }
+        }
+        let hasStableActiveProject = stableProjects.map {
+            !$0.projects.isEmpty && !$0.activeProject.isEmpty
+        } ?? false
+        if enabled && !hasStableActiveProject {
+            uiState.availableLocations = []
+            uiState.selectedManualLocation = nil
+            showNoProjectNotification()
+            await reconcileAutomaticLocationServices()
+            return false
+        }
         uiState.showAutoActivitiesNudge = enabled ? false : uiState.showAutoActivitiesNudge
         activityLogger.logSystem(
             enabled ? "Automatic activities enabled by user." : "Automatic activities disabled by user.",
             .info
         )
+        if enabled {
+            guard await waitForProjectMembershipStability(chave: chave) else { return false }
+            guard uiState.userProjects == stableProjects else {
+                return await setAutomaticActivitiesEnabled(true)
+            }
+        }
         await reconcileAutomaticLocationServices(forceGeofenceRefresh: enabled)
         // No OFF, permite também ao orquestrador cancelar notificações futuras da Pausa Programada.
         await orchestrator.runOnce(.foreground)
@@ -506,6 +592,7 @@ final class CheckViewModel {
                 uiState.historyState = state
                 uiState.transportEnabled = state.transportEnabled
                 if uiState.selectedManualLocation == nil { uiState.selectedManualLocation = state.currentLocal }
+                await orchestrator.confirmedState(chave: chave, newState: state)
             case .failure(let error):
                 guard uiState.chave == chave else { return }
                 if case .unauthorized = error { handleAuthExpiry() }
@@ -515,13 +602,19 @@ final class CheckViewModel {
 
     private func handleAuthExpiry() {
         stopCheckStream()
+        resetProjectMembershipSync()
+        let expiredChave = uiState.chave
         Task {
+            guard uiState.chave == expiredChave, !uiState.isAuthenticated else { return }
+            await orchestrator.invalidateAutomationContext()
+            guard uiState.chave == expiredChave, !uiState.isAuthenticated else { return }
             await significantLocationMonitor.stop()
             await geofenceRegionManager?.unregisterAll()
         }
         if var status = uiState.authStatus { status.authenticated = false; uiState.authStatus = status }
         uiState.isSubmitting = false
         uiState.isProjectsLoading = false
+        uiState.isProjectMembershipSyncing = false
         uiState.isHistoryLoading = false
         uiState.isLocationLoading = false
         uiState.notificationPrimary = ""
@@ -598,20 +691,48 @@ final class CheckViewModel {
     }
 
     private func loadUserProjects(chave: String) async {
+        // Uma seleção otimista em andamento já será reconciliada pelo worker de PUT. Um GET paralelo
+        // poderia repor temporariamente o estado antigo do servidor sobre as checkboxes recém-alteradas.
+        guard projectMembershipSyncTask == nil else { return }
+        projectMembershipLoadGeneration += 1
+        let loadGeneration = projectMembershipLoadGeneration
         uiState.isProjectsLoading = true
         switch await projectRepository.getUserProjects() {
         case .success(let projects):
-            guard uiState.chave == chave, uiState.isAuthenticated else { return }
+            guard uiState.chave == chave, uiState.isAuthenticated,
+                  loadGeneration == projectMembershipLoadGeneration else { return }
+            let previousActiveProject = (authoritativeUserProjects ?? uiState.userProjects)?.activeProject
+            authoritativeUserProjects = projects
+            uiState.userProjects = projects
+            updateNoProjectNotification(for: projects)
             await persistUserProjects(chave: chave, projects: projects.projects, activeProject: projects.activeProject)
+            guard uiState.chave == chave, uiState.isAuthenticated,
+                  loadGeneration == projectMembershipLoadGeneration else { return }
+            if let previousActiveProject, previousActiveProject != projects.activeProject {
+                await orchestrator.invalidateAutomationContext()
+                guard uiState.chave == chave, uiState.isAuthenticated,
+                      loadGeneration == projectMembershipLoadGeneration else { return }
+            }
+            if projects.projects.isEmpty {
+                uiState.availableLocations = []
+                uiState.selectedManualLocation = nil
+            } else {
+                await loadAvailableLocations(chave: chave)
+            }
             await reconcileAutomaticLocationServices(forceGeofenceRefresh: true)
             await orchestrator.runOnce(.foreground)
-            guard uiState.chave == chave, uiState.isAuthenticated else { return }
-            uiState.userProjects = projects
+            guard uiState.chave == chave, uiState.isAuthenticated,
+                  loadGeneration == projectMembershipLoadGeneration else { return }
             uiState.isProjectsLoading = false
         case .failure(let error):
-            guard uiState.chave == chave else { return }
+            guard uiState.chave == chave, loadGeneration == projectMembershipLoadGeneration else { return }
             if case .unauthorized = error { handleAuthExpiry() }
-            else { uiState.isProjectsLoading = false }
+            else {
+                uiState.isProjectsLoading = false
+                uiState.notificationPrimary = t("projects.userProjectsLoadFailed", lang: languageCode)
+                uiState.notificationSecondary = ""
+                uiState.notificationTone = .error
+            }
         }
     }
 
@@ -627,61 +748,210 @@ final class CheckViewModel {
     }
 
     func onProjectMembershipToggled(_ projectName: String) {
-        let current = uiState.userProjects?.projects ?? []
+        guard uiState.isAuthenticated, let currentState = uiState.userProjects else { return }
+        projectMembershipLoadGeneration += 1
+        uiState.isProjectsLoading = false
+
+        let current = currentState.projects
         let next = current.contains(projectName)
             ? current.filter { $0 != projectName }
             : current + [projectName]
-        guard !next.isEmpty else {
-            uiState.notificationPrimary = t("projects.selectAtLeastOne", lang: languageCode)
-            uiState.notificationTone = .error
-            return
+        let optimisticActiveProject = next.contains(currentState.activeProject)
+            ? currentState.activeProject
+            : next.first ?? ""
+
+        if authoritativeUserProjects == nil {
+            authoritativeUserProjects = currentState
         }
-        uiState.isProjectsLoading = true
+        pendingProjectMemberships = next
+        uiState.userProjects = UserProjects(projects: next, activeProject: optimisticActiveProject)
+        uiState.isProjectMembershipSyncing = true
+
         let chave = uiState.chave
-        Task {
-            switch await projectRepository.updateUserProjects(next) {
-            case .success(let projects):
-                guard uiState.chave == chave, uiState.isAuthenticated else { return }
-                await persistUserProjects(chave: chave, projects: projects.projects, activeProject: projects.activeProject)
-                await loadAvailableLocations(chave: chave)
-                await reconcileAutomaticLocationServices(forceGeofenceRefresh: true)
-                await orchestrator.runOnce(.foreground)
-                guard uiState.chave == chave, uiState.isAuthenticated else { return }
-                uiState.userProjects = projects
-                uiState.isProjectsLoading = false
-                uiState.selectedManualLocation = nil
-            case .failure(let error):
-                guard uiState.chave == chave else { return }
-                if case .unauthorized = error { handleAuthExpiry() }
-                else { uiState.isProjectsLoading = false }
-            }
+        guard projectMembershipSyncTask == nil else { return }
+        let syncGeneration = projectMembershipSyncGeneration
+        projectMembershipSyncTask = Task { [weak self] in
+            await self?.synchronizeProjectMemberships(chave: chave, generation: syncGeneration)
         }
     }
 
+    private func synchronizeProjectMemberships(chave: String, generation: Int) async {
+        var needsReconciliation = false
+        var needsAccuracyRetryInvalidation = false
+
+        while !Task.isCancelled {
+            guard uiState.chave == chave, uiState.isAuthenticated,
+                  generation == projectMembershipSyncGeneration,
+                  let requestedProjects = pendingProjectMemberships else { break }
+            pendingProjectMemberships = nil
+
+            switch await projectRepository.updateUserProjects(requestedProjects) {
+            case .success(let projects):
+                guard !Task.isCancelled, uiState.chave == chave, uiState.isAuthenticated,
+                      generation == projectMembershipSyncGeneration else { return }
+                let previousActiveProject = authoritativeUserProjects?.activeProject ?? ""
+                // A resposta do servidor é a fonte autoritativa. Se houve outro toque enquanto o PUT
+                // estava em andamento, preservamos apenas a seleção otimista mais nova até o próximo PUT.
+                authoritativeUserProjects = projects
+                if previousActiveProject != projects.activeProject {
+                    needsAccuracyRetryInvalidation = true
+                }
+                needsReconciliation = true
+                uiState.selectedManualLocation = nil
+                if pendingProjectMemberships == nil {
+                    uiState.userProjects = projects
+                    if uiState.notificationPrimary == t("projects.updateFailed", lang: languageCode) {
+                        uiState.notificationPrimary = ""
+                        uiState.notificationSecondary = ""
+                        uiState.notificationTone = .none
+                    }
+                }
+
+            case .failure(let error):
+                guard !Task.isCancelled, uiState.chave == chave,
+                      generation == projectMembershipSyncGeneration else { return }
+                if case .unauthorized = error {
+                    handleAuthExpiry()
+                    return
+                }
+                uiState.notificationPrimary = t("projects.updateFailed", lang: languageCode)
+                uiState.notificationTone = .error
+                if pendingProjectMemberships == nil, let authoritativeUserProjects {
+                    uiState.userProjects = authoritativeUserProjects
+                    needsReconciliation = true
+                }
+            }
+
+            // Um toque ocorrido durante o request já contém a seleção completa desejada. Envia-o antes
+            // dos efeitos derivados, mantendo PUTs estritamente ordenados e sem resposta antiga pisar nele.
+            if pendingProjectMemberships != nil { continue }
+
+            if needsReconciliation, let authoritativeUserProjects {
+                updateNoProjectNotification(for: authoritativeUserProjects)
+                await persistUserProjects(
+                    chave: chave,
+                    projects: authoritativeUserProjects.projects,
+                    activeProject: authoritativeUserProjects.activeProject)
+                guard !Task.isCancelled, uiState.chave == chave, uiState.isAuthenticated,
+                      generation == projectMembershipSyncGeneration else { return }
+                if pendingProjectMemberships != nil { continue }
+                if needsAccuracyRetryInvalidation {
+                    // Só uma mudança real de contexto ativo invalida o prazo; GET/PUT idêntico não reinicia
+                    // um episódio válido nem repete sua notificação.
+                    await orchestrator.invalidateAutomationContext()
+                    guard !Task.isCancelled, uiState.chave == chave, uiState.isAuthenticated,
+                          generation == projectMembershipSyncGeneration else { return }
+                    if pendingProjectMemberships != nil { continue }
+                    needsAccuracyRetryInvalidation = false
+                }
+
+                if authoritativeUserProjects.projects.isEmpty {
+                    uiState.availableLocations = []
+                } else {
+                    await loadAvailableLocations(chave: chave)
+                }
+                guard !Task.isCancelled, uiState.chave == chave, uiState.isAuthenticated,
+                      generation == projectMembershipSyncGeneration else { return }
+                if pendingProjectMemberships != nil { continue }
+
+                await reconcileAutomaticLocationServices(forceGeofenceRefresh: true)
+                guard !Task.isCancelled, uiState.chave == chave, uiState.isAuthenticated,
+                      generation == projectMembershipSyncGeneration else { return }
+                if pendingProjectMemberships != nil { continue }
+
+                await orchestrator.runOnce(.foreground)
+                guard !Task.isCancelled, uiState.chave == chave, uiState.isAuthenticated,
+                      generation == projectMembershipSyncGeneration else { return }
+                if pendingProjectMemberships != nil { continue }
+
+                needsReconciliation = false
+            }
+        }
+
+        guard generation == projectMembershipSyncGeneration else { return }
+        projectMembershipSyncTask = nil
+        uiState.isProjectMembershipSyncing = false
+
+        // Um novo toque pode chegar na última suspensão dos efeitos derivados. Não o deixa sem worker.
+        if pendingProjectMemberships != nil {
+            onProjectMembershipSyncNeeded(chave: chave)
+        }
+    }
+
+    private func onProjectMembershipSyncNeeded(chave: String) {
+        guard projectMembershipSyncTask == nil, pendingProjectMemberships != nil else { return }
+        uiState.isProjectMembershipSyncing = true
+        let syncGeneration = projectMembershipSyncGeneration
+        projectMembershipSyncTask = Task { [weak self] in
+            await self?.synchronizeProjectMemberships(chave: chave, generation: syncGeneration)
+        }
+    }
+
+    private func resetProjectMembershipSync() {
+        projectMembershipSyncGeneration += 1
+        projectMembershipLoadGeneration += 1
+        projectMembershipSyncTask?.cancel()
+        projectMembershipSyncTask = nil
+        pendingProjectMemberships = nil
+        authoritativeUserProjects = nil
+        uiState.isProjectMembershipSyncing = false
+    }
+
+    private func waitForProjectMembershipStability(chave: String) async -> Bool {
+        while uiState.chave == chave, uiState.isAuthenticated {
+            if let syncTask = projectMembershipSyncTask {
+                await syncTask.value
+                continue
+            }
+            if uiState.isProjectsLoading {
+                try? await Task.sleep(for: .milliseconds(10))
+                continue
+            }
+            return true
+        }
+        return false
+    }
+
     private func persistUserProjects(chave: String, projects: [String], activeProject: String) async {
-        guard chave.count == 4 else { return }
-        var map = (try? JSONCoding.decoder.decode(
-            [String: UserSettings].self,
-            from: Data((await appPreferences.userSettingsJson()).utf8))) ?? [:]
-        var settings = resolvePersistedUserSettings(map, chave)
-        settings.projects = projects
-        settings.activeProject = activeProject
-        map = withPersistedUserSettings(map, chave, settings)
-        guard let data = try? JSONCoding.encoder.encode(map),
-              let json = String(data: data, encoding: .utf8) else { return }
-        await appPreferences.setUserSettingsJson(json)
+        guard chave == uiState.chave, chave.count == 4 else { return }
+        let persistence = enqueueSettingsUpdate { settings in
+            settings.projects = projects
+            settings.activeProject = activeProject
+        }
+        await persistence.value
+    }
+
+    private func showNoProjectNotification() {
+        uiState.notificationPrimary = t("projects.noActiveProject", lang: languageCode)
+        uiState.notificationSecondary = ""
+        uiState.notificationTone = .error
+    }
+
+    private func updateNoProjectNotification(for projects: UserProjects) {
+        if projects.projects.isEmpty {
+            showNoProjectNotification()
+            return
+        }
+
+        let noProjectMessages = Set(supportedLanguages.map {
+            t("projects.noActiveProject", lang: $0.code)
+        })
+        if noProjectMessages.contains(uiState.notificationPrimary) {
+            uiState.notificationPrimary = ""
+            uiState.notificationSecondary = ""
+            uiState.notificationTone = .none
+        }
     }
 
     func onSubmit() {
         let state = uiState
         guard state.canSubmit else { return }
-        guard !state.automaticActivitiesEnabled || state.isAccuracyTooLow else {
-            uiState.notificationPrimary = t("registration.disableAutomaticActivitiesForManualSubmit", lang: languageCode)
-            uiState.notificationTone = .error
+        guard let project = state.userProjects?.activeProject, !project.isEmpty else {
+            showNoProjectNotification()
             return
         }
-        guard let project = state.userProjects?.activeProject, !project.isEmpty else {
-            uiState.notificationPrimary = t("projects.noActiveProject", lang: languageCode)
+        guard !state.automaticActivitiesEnabled || state.isAccuracyTooLow else {
+            uiState.notificationPrimary = t("registration.disableAutomaticActivitiesForManualSubmit", lang: languageCode)
             uiState.notificationTone = .error
             return
         }
@@ -716,6 +986,12 @@ final class CheckViewModel {
                 clientEventId: clientEventId) {
             case .success(let newState):
                 guard uiState.chave == state.chave, uiState.isAuthenticated else { return }
+                await orchestrator.acceptedCheck(
+                    chave: state.chave,
+                    project: project,
+                    action: state.selectedAction,
+                    newState: newState)
+                guard uiState.chave == state.chave, uiState.isAuthenticated else { return }
                 uiState.historyState = newState
                 uiState.isSubmitting = false
                 uiState.notificationPrimary = t(
@@ -740,11 +1016,27 @@ final class CheckViewModel {
                         local: location,
                         informe: informe == .retroativo ? "retroativo" : "normal")))
                     guard uiState.chave == state.chave else { return }
+                    await orchestrator.invalidateAccuracyRetry()
+                    guard uiState.chave == state.chave else { return }
                     uiState.isSubmitting = false
                     uiState.notificationPrimary = t("status.savedOffline", lang: languageCode)
                     uiState.notificationTone = .success
                     activityLogger.logQueuedOffline(
                         .user, state.selectedAction == .checkIn ? .checkIn : .checkOut, location)
+                } else if case .conflict = error {
+                    // Um 409 pode significar que a membership foi removida em outro cliente. Revalida
+                    // antes de escolher a mensagem, pois nem todo conflito do endpoint é "sem projeto".
+                    await loadUserProjects(chave: state.chave)
+                    guard uiState.chave == state.chave, uiState.isAuthenticated else { return }
+                    uiState.isSubmitting = false
+                    if uiState.userProjects?.projects.isEmpty == true {
+                        showNoProjectNotification()
+                    } else {
+                        uiState.notificationPrimary = t("status.submitFailed", lang: languageCode)
+                        uiState.notificationSecondary = ""
+                        uiState.notificationTone = .error
+                    }
+                    logManual(action: state.selectedAction, location: location, success: false)
                 } else {
                     guard uiState.chave == state.chave else { return }
                     let detail: String? = if case .http(_, let message) = error { message } else { nil }
@@ -771,6 +1063,7 @@ final class CheckViewModel {
                 // Cancela também as transições locais da Pausa Programada antes de apagar o mapa
                 // de configurações que permite ao orquestrador encontrá-las.
                 _ = await setAutomaticActivitiesEnabled(false)
+                await orchestrator.invalidateAutomationContext()
                 await significantLocationMonitor.stop()
                 await geofenceRegionManager?.unregisterAll()
                 securePasswordStore.clearAll()
@@ -778,6 +1071,7 @@ final class CheckViewModel {
                 await offlineQueue.clear()
                 stopCheckStream()
                 stopPendingApprovalPolling()
+                resetProjectMembershipSync()
                 uiState = CheckUiState(isInitializing: false)
             case .failure(let error):
                 let message = { if case .conflict = error { return t("settings.deleteAccountBlocked", lang: languageCode) }
@@ -793,6 +1087,7 @@ final class CheckViewModel {
     /// já enviados ao servidor; essa solicitação continua sendo feita pelo canal de privacidade.
     func deleteLocalData() async {
         if uiState.isAuthenticated { _ = await setAutomaticActivitiesEnabled(false) }
+        await orchestrator.invalidateAutomationContext()
         await significantLocationMonitor.stop()
         await geofenceRegionManager?.unregisterAll()
         _ = await authRepository.logout()
@@ -806,6 +1101,7 @@ final class CheckViewModel {
         passwordVerifyTask?.cancel()
         chaveTask?.cancel()
         settingsPersistenceTask?.cancel()
+        resetProjectMembershipSync()
         uiState = CheckUiState(isInitializing: false)
         languageCode = "pt"
     }
@@ -838,8 +1134,13 @@ final class CheckViewModel {
         Task {
             let changed = await setAutomaticActivitiesEnabled(enabled)
             guard changed else {
-                uiState.notificationPrimary = t("autoActivities.enableFailed", lang: languageCode)
-                uiState.notificationTone = .error
+                if uiState.userProjects?.projects.isEmpty == true {
+                    showNoProjectNotification()
+                } else {
+                    uiState.notificationPrimary = t("autoActivities.enableFailed", lang: languageCode)
+                    uiState.notificationSecondary = ""
+                    uiState.notificationTone = .error
+                }
                 return
             }
             await refreshPermissionState(captureIfEligible: enabled)
@@ -991,7 +1292,7 @@ final class CheckViewModel {
                 settings.suspendSaturdays = suspendSat
                 settings.suspendSundays = suspendSun
         }
-        reconcileSettingsAfterPersistence(persisted)
+        reconcileSettingsAfterPersistence(persisted, scheduledPauseChanged: true)
     }
 
     func onNotificationSettingsChanged(activities: Bool, scheduledPause: Bool, accident: Bool) {
@@ -1062,13 +1363,20 @@ final class CheckViewModel {
         return task
     }
 
-    private func reconcileSettingsAfterPersistence(_ persistence: Task<Void, Never>) {
+    private func reconcileSettingsAfterPersistence(
+        _ persistence: Task<Void, Never>,
+        scheduledPauseChanged: Bool = false
+    ) {
         // DatePicker pode emitir várias alterações rápidas. Só a configuração mais recente deve
         // reavaliar a pausa, e somente depois de estar disponível ao orquestrador nas preferências.
         settingsReconciliationTask?.cancel()
         settingsReconciliationTask = Task {
             await persistence.value
             guard !Task.isCancelled else { return }
+            if scheduledPauseChanged {
+                await orchestrator.scheduledPauseSettingsDidChange()
+                guard !Task.isCancelled else { return }
+            }
             await orchestrator.runOnce(.foreground)
         }
     }

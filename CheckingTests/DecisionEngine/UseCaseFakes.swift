@@ -33,6 +33,7 @@ final class FakeCheckRepository: CheckRepository, @unchecked Sendable {
         .success(LocationOptions(items: ["Unidade P80"], accuracyThresholdMeters: 50, mixedZoneIntervalMinutes: 15))
     var submitResult: AppResult<HistoryState> = .success(ucHistory(.checkIn))
     var submitHandler: (@Sendable (CheckAction, String?) -> AppResult<HistoryState>)?
+    var submitGate: AsyncGate?
     private(set) var submitCount = 0
     private(set) var lastSubmitAction: CheckAction?
     private(set) var lastSubmitLocal: String?
@@ -50,6 +51,7 @@ final class FakeCheckRepository: CheckRepository, @unchecked Sendable {
         lastSubmitLocal = local
         submitCalls.append(SubmitCall(chave: chave, projeto: projeto, action: action, local: local,
                                       informe: informe, eventTime: eventTime, clientEventId: clientEventId))
+        await submitGate?.wait()
         if let handler = submitHandler { return handler(action, local) }
         return submitResult
     }
@@ -58,7 +60,11 @@ final class FakeCheckRepository: CheckRepository, @unchecked Sendable {
 final class FakeOfflineQueue: OfflineCheckQueueing, @unchecked Sendable {
     private(set) var enqueued: [PendingCheckEvent] = []
     private(set) var clearCount = 0
-    func enqueue(_ event: PendingCheckEvent) async { enqueued.append(event) }
+    var enqueueGate: AsyncGate?
+    func enqueue(_ event: PendingCheckEvent) async {
+        await enqueueGate?.wait()
+        enqueued.append(event)
+    }
     func clear() async { enqueued.removeAll(); clearCount += 1 }
 }
 

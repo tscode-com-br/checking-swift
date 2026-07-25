@@ -79,6 +79,15 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(t("does.not.exist", lang: "en"), "does.not.exist")
     }
 
+    func test_noProjectMessageExplainsMissingMembership() {
+        XCTAssertEqual(
+            t("projects.noActiveProject", lang: "pt"),
+            "O usuário não está cadastrado em nenhum projeto.")
+        XCTAssertEqual(
+            t("projects.noActiveProject", lang: "en"),
+            "The user is not registered in any project.")
+    }
+
     func test_interpolationMatchesAndroidMissingTokenSemantics() {
         XCTAssertEqual(
             t("location.accuracyTemplate", ["accuracy": "±8 m"], lang: "en"),

@@ -27,6 +27,11 @@ struct RunAutomaticActivitiesUseCase: Sendable {
         let match: LocationMatch
         switch await captureLocationUseCase(accuracyThresholdMeters) {
         case .matched(let m):
+            if m.status == .accuracyTooLow {
+                let lastAction = resolveLastRecordedAction(currentState)
+                let expectedAction: CheckAction? = lastAction == nil || lastAction == .checkOut ? .checkIn : nil
+                return .accuracyTooLow(expectedAction: expectedAction)
+            }
             match = m
         case .networkError(let reading):
             // Offline com fix → enfileira Raw (o servidor decide no replay).
@@ -38,8 +43,10 @@ struct RunAutomaticActivitiesUseCase: Sendable {
                 activityLogger.logLocation("Location reading queued offline — will sync on reconnect.", nil, .warning)
             }
             return .networkError
-        case .timeout, .noPermission:
-            return .noAction
+        case .timeout:
+            return .locationTimeout
+        case .noPermission:
+            return .noPermission
         }
 
         // 3) Matriz de decisão (função-mestre pura).
