@@ -88,11 +88,13 @@ final class SpyOrchestrator: OrchestratorRunning, @unchecked Sendable {
     private let lock = NSLock()
     private var calls: [OrchestratorTrigger] = []
     private var accuracyRetryInvalidations = 0
+    private var scheduledPauseChanges = 0
     private var accepted: [(String, String, CheckAction, HistoryState)] = []
     private var confirmed: [(String, HistoryState)] = []
     private var pendingRunGate: AsyncGate?
     var runOnceCalls: [OrchestratorTrigger] { lock.withLock { calls } }
     var invalidateAccuracyRetryCount: Int { lock.withLock { accuracyRetryInvalidations } }
+    var scheduledPauseSettingsChangeCount: Int { lock.withLock { scheduledPauseChanges } }
     var acceptedChecks: [(String, String, CheckAction, HistoryState)] { lock.withLock { accepted } }
     var confirmedStates: [(String, HistoryState)] { lock.withLock { confirmed } }
     var nextRunGate: AsyncGate? {
@@ -109,6 +111,10 @@ final class SpyOrchestrator: OrchestratorRunning, @unchecked Sendable {
     }
     func invalidateAccuracyRetry() async {
         lock.withLock { accuracyRetryInvalidations += 1 }
+    }
+    func scheduledPauseSettingsDidChange() async {
+        lock.withLock { scheduledPauseChanges += 1 }
+        await runOnce(.foreground)
     }
     func acceptedCheck(
         chave: String,

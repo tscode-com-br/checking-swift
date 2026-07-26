@@ -27,6 +27,7 @@ final class FakeCheckRepository: CheckRepository, @unchecked Sendable {
     }
     var matchLocationResult: AppResult<LocationMatch> = .failure(.unknown(description: nil))
     var getStateResult: AppResult<HistoryState> = .failure(.unknown(description: nil))
+    var queuedGetStateResults: [AppResult<HistoryState>] = []
     var getHistoryResult: AppResult<[CheckHistoryEntry]> = .success([])
     var getGeofencesResult: AppResult<[GeofenceCircle]> = .success([])
     var getLocationsResult: AppResult<LocationOptions> =
@@ -34,13 +35,19 @@ final class FakeCheckRepository: CheckRepository, @unchecked Sendable {
     var submitResult: AppResult<HistoryState> = .success(ucHistory(.checkIn))
     var submitHandler: (@Sendable (CheckAction, String?) -> AppResult<HistoryState>)?
     var submitGate: AsyncGate?
+    private let getStateLock = NSLock()
     private(set) var submitCount = 0
     private(set) var lastSubmitAction: CheckAction?
     private(set) var lastSubmitLocal: String?
     private(set) var submitCalls: [SubmitCall] = []
 
     func matchLocation(_ lat: Double, _ lon: Double, _ accuracyMeters: Double?) async -> AppResult<LocationMatch> { matchLocationResult }
-    func getState(_ chave: String) async -> AppResult<HistoryState> { getStateResult }
+    func getState(_ chave: String) async -> AppResult<HistoryState> {
+        getStateLock.withLock {
+            guard !queuedGetStateResults.isEmpty else { return getStateResult }
+            return queuedGetStateResults.removeFirst()
+        }
+    }
     func getHistory(_ chave: String) async -> AppResult<[CheckHistoryEntry]> { getHistoryResult }
     func getGeofences(_ chave: String) async -> AppResult<[GeofenceCircle]> { getGeofencesResult }
     func getLocations() async -> AppResult<LocationOptions> { getLocationsResult }

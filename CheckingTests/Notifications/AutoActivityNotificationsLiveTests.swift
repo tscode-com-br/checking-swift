@@ -294,4 +294,44 @@ final class AutoActivityNotificationsLiveTests: XCTestCase {
         XCTAssertFalse(AppDelegate.isAccidentPayload(["type": "checkin"]))
         XCTAssertFalse(AppDelegate.isAccidentPayload(["aps": ["alert": "hello"]]))
     }
+
+    func test_accidentNotificationResponseRecognition_requiresOpenActionAndAccidentContent() {
+        let category = AppDelegate.accidentNotificationCategory
+
+        XCTAssertTrue(AppDelegate.shouldOpenAccidentNotification(
+            actionIdentifier: AppDelegate.openAccidentAction,
+            categoryIdentifier: category,
+            userInfo: [:]
+        ))
+        XCTAssertTrue(AppDelegate.shouldOpenAccidentNotification(
+            actionIdentifier: UNNotificationDefaultActionIdentifier,
+            categoryIdentifier: "",
+            userInfo: ["checking_event": "accident"]
+        ))
+        XCTAssertTrue(AppDelegate.shouldOpenAccidentNotification(
+            actionIdentifier: UNNotificationDefaultActionIdentifier,
+            categoryIdentifier: category,
+            userInfo: [:]
+        ))
+        XCTAssertTrue(AppDelegate.shouldOpenAccidentNotification(
+            actionIdentifier: AppDelegate.openAccidentAction,
+            categoryIdentifier: "",
+            userInfo: ["event": "accident_opened"]
+        ))
+        XCTAssertFalse(AppDelegate.shouldOpenAccidentNotification(
+            actionIdentifier: UNNotificationDismissActionIdentifier,
+            categoryIdentifier: category,
+            userInfo: ["checking_event": "accident"]
+        ))
+        XCTAssertFalse(AppDelegate.shouldOpenAccidentNotification(
+            actionIdentifier: UNNotificationDefaultActionIdentifier,
+            categoryIdentifier: "",
+            userInfo: ["type": "checkin"]
+        ))
+        XCTAssertFalse(AppDelegate.shouldOpenAccidentNotification(
+            actionIdentifier: AppDelegate.openAccidentAction,
+            categoryIdentifier: "",
+            userInfo: ["type": "checkout"]
+        ))
+    }
 }

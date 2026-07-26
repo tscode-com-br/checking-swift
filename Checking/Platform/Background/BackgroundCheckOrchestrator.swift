@@ -12,6 +12,7 @@ actor BackgroundCheckOrchestrator {
     static let reauthNotificationCooldown: TimeInterval = 60 * 60
     static let accuracyRetryInterval: TimeInterval = 180
     static let scheduledPauseActivationDelay: TimeInterval = 10
+    static let scheduledPauseConfirmationBackoff: TimeInterval = 180
     static let flagPauseActive = "scheduled_pause_active"
 
     private enum SkipDecision { case run, skip, noFix }
@@ -185,11 +186,17 @@ actor BackgroundCheckOrchestrator {
             await drainPendingWorkIfNeeded()
             return
         }
-        if trigger == .pauseActivation, scheduledPauseDeferral?.phase != .activationScheduled {
-            appRefreshScheduler.clearPauseActivationDeadlineAndScheduleRegular()
-            isRunning = false
-            await drainPendingWorkIfNeeded()
-            return
+        if trigger == .pauseActivation {
+            let phase = scheduledPauseDeferral?.phase
+            let hasPendingActivation =
+                scheduledPauseDeferral?.activationAt != nil
+                    && (phase == .activationScheduled || phase == .awaitingCheckout)
+            if !hasPendingActivation {
+                appRefreshScheduler.clearPauseActivationDeadlineAndScheduleRegular()
+                isRunning = false
+                await drainPendingWorkIfNeeded()
+                return
+            }
         }
         let token = await backgroundTaskGuard.begin()
         isSessionExpired = false
@@ -220,6 +227,13 @@ actor BackgroundCheckOrchestrator {
             await advanceAccuracyRetry(episode)
         }
         backgroundTaskGuard.end(token)
+        if trigger == .foreground,
+           evaluationGeneration == accuracyRetryGeneration,
+           pauseEvaluationGeneration == scheduledPauseGeneration {
+            // Consome a solicitação somente depois de uma avaliação da mesma geração. Se alguma
+            // invalidação atravessou um await, ela permanece pendente e é drenada com um snapshot novo.
+            pendingPauseReconciliation = false
+        }
         isRunning = false
         await drainPendingWorkIfNeeded()
     }
@@ -422,8 +436,6 @@ actor BackgroundCheckOrchestrator {
                 && endedRuntime?.phase == .active
                 && endedRuntime?.chave == chave
                 && endedRuntime?.activeProject == userSettings.activeProject
-                && endedRuntime?.settings == pauseSettings
-                && now >= (endedRuntime?.windowEnd ?? now)
             var preserveConsumedResumeNotification = false
             if shouldNotifyEnd {
                 let alreadyScheduled = await pauseAlarms.consumeScheduledTransition(
@@ -533,7 +545,8 @@ actor BackgroundCheckOrchestrator {
                 guard generation == scheduledPauseGeneration else {
                     return .stop(.noAction)
                 }
-                if resolveLastRecordedAction(state) == .checkIn {
+                switch resolveLastRecordedAction(state) {
+                case .checkIn:
                     await transitionScheduledPauseToAwaiting(
                         chave: chave,
                         activeProject: userSettings.activeProject,
@@ -542,29 +555,35 @@ actor BackgroundCheckOrchestrator {
                         generation: generation,
                         lang: lang)
                     return .proceed(currentState: state, usedFreshState: true)
+
+                case .checkOut:
+                    // O estado fresco pode conter um checkout mais novo que aquele que originou o
+                    // deadline (inclusive vindo de outro cliente). Reancora sempre pelos dados da API
+                    // para preservar os dez segundos completos antes de ativar a pausa.
+                    return await scheduleOrActivateAfterConfirmedCheckout(
+                        state: state,
+                        chave: chave,
+                        activeProject: userSettings.activeProject,
+                        settings: pauseSettings,
+                        window: window,
+                        userSettings: userSettings,
+                        generation: generation,
+                        now: now,
+                        lang: lang)
+
+                case nil:
+                    await activateScheduledPause(
+                        runtime,
+                        userSettings: userSettings,
+                        generation: generation,
+                        now: now,
+                        lang: lang)
+                    return .stop(.paused)
                 }
-                await activateScheduledPause(
-                    runtime,
-                    userSettings: userSettings,
-                    generation: generation,
-                    now: now,
-                    lang: lang)
-                return .stop(.paused)
 
-            case .failure:
-                // Sem confirmação não converte grace em ACTIVE e não deixa novos autos entrarem.
-                await rescheduleScheduledPauseActivationAfterUnconfirmedState(
-                    runtime,
-                    userSettings: userSettings,
-                    generation: generation,
-                    now: now,
-                    lang: lang)
-                return .stop(.networkError)
-            }
-
-        case .awaitingCheckout, nil:
-            switch await getFreshRemoteState(chave) {
-            case .failure:
+            case .failure(let error):
+                // Sem confirmação não converte grace em ACTIVE. Voltar a AWAITING conserva a
+                // possibilidade de um estado confirmado/foreground resolver antes do próximo wake.
                 await transitionScheduledPauseToAwaiting(
                     chave: chave,
                     activeProject: userSettings.activeProject,
@@ -572,8 +591,61 @@ actor BackgroundCheckOrchestrator {
                     window: window,
                     generation: generation,
                     lang: lang)
+                guard generation == scheduledPauseGeneration,
+                      let awaitingRuntime = scheduledPauseDeferral else {
+                    return .stop(.networkError)
+                }
+                if shouldRetryScheduledPauseConfirmation(error) {
+                    await scheduleScheduledPauseConfirmationRetry(
+                        awaitingRuntime,
+                        retryAt: now.addingTimeInterval(Self.scheduledPauseActivationDelay),
+                        userSettings: userSettings,
+                        generation: generation,
+                        lang: lang)
+                }
+                return .stop(.networkError)
+            }
+
+        case .awaitingCheckout, nil:
+            switch await getFreshRemoteState(chave) {
+            case .failure(let error):
+                let previousRetryAt =
+                    scheduledPauseDeferral?.phase == .awaitingCheckout
+                        ? scheduledPauseDeferral?.activationAt
+                        : nil
+                await transitionScheduledPauseToAwaiting(
+                    chave: chave,
+                    activeProject: userSettings.activeProject,
+                    settings: pauseSettings,
+                    window: window,
+                    generation: generation,
+                    lang: lang)
+                guard generation == scheduledPauseGeneration,
+                      let runtime = scheduledPauseDeferral else {
+                    return .stop(.networkError)
+                }
+                if shouldRetryScheduledPauseConfirmation(error) {
+                    let retryAt: Date
+                    if let previousRetryAt, previousRetryAt > now {
+                        retryAt = previousRetryAt
+                    } else {
+                        retryAt = now.addingTimeInterval(
+                            previousRetryAt == nil
+                                ? Self.scheduledPauseActivationDelay
+                                : Self.scheduledPauseConfirmationBackoff)
+                    }
+                    // A confirmação remota é conservadora: uma falha nunca equivale a "sem check-in".
+                    // O primeiro retry transitório é rápido; falhas consecutivas recuam para três minutos
+                    // para não consultar a API seis vezes por minuto durante uma indisponibilidade longa.
+                    await scheduleScheduledPauseConfirmationRetry(
+                        runtime,
+                        retryAt: retryAt,
+                        userSettings: userSettings,
+                        generation: generation,
+                        lang: lang)
+                }
                 // Falha não equivale a "sem histórico". Sem estado confirmado, o motor poderia interpretar
-                // nil como primeiro uso e criar um CHECKIN; aguarda outro despertar conservadoramente.
+                // nil como primeiro uso e criar um CHECKIN; aguarda a confirmação conservadoramente.
                 return .stop(.networkError)
 
             case .success(let state):
@@ -755,7 +827,7 @@ actor BackgroundCheckOrchestrator {
         await persistScheduledPauseRuntime(runtime)
         guard generation == scheduledPauseGeneration,
               scheduledPauseDeferral?.id == runtime.id,
-              scheduledPauseDeferral?.phase == .active else { return }
+              scheduledPauseDeferral?.phase == .awaitingCheckout else { return }
         appRefreshScheduler.clearPauseActivationDeadlineAndScheduleRegular()
         armScheduledPauseTransition(at: window.end)
         await appPrefs.setFlag(Self.flagPauseActive, false)
@@ -866,23 +938,21 @@ actor BackgroundCheckOrchestrator {
         await cancelAccuracyRetryEpisode()
     }
 
-    private func rescheduleScheduledPauseActivationAfterUnconfirmedState(
+    private func scheduleScheduledPauseConfirmationRetry(
         _ existing: ScheduledPauseDeferral,
+        retryAt: Date,
         userSettings: UserSettings,
         generation: UInt64,
-        now: Date,
         lang: String
     ) async {
-        guard generation == scheduledPauseGeneration else { return }
-        let next = now.addingTimeInterval(Self.scheduledPauseActivationDelay)
-        if next >= existing.windowEnd {
-            await transitionScheduledPauseToTerminal(existing, generation: generation, lang: lang)
+        guard generation == scheduledPauseGeneration,
+              existing.phase == .awaitingCheckout else { return }
+        guard retryAt < existing.windowEnd else {
+            appRefreshScheduler.clearPauseActivationDeadlineAndScheduleRegular()
             return
         }
         var runtime = existing
-        runtime.phase = .activationScheduled
-        runtime.activationEpochMs = epochMs(next)
-        scheduledPauseDeferral = runtime
+        runtime.activationEpochMs = epochMs(retryAt)
         await persistScheduledPauseRuntime(runtime)
         guard generation == scheduledPauseGeneration else { return }
         await armScheduledPauseActivation(
@@ -892,21 +962,34 @@ actor BackgroundCheckOrchestrator {
             lang: lang)
     }
 
+    private func shouldRetryScheduledPauseConfirmation(_ error: ApiError) -> Bool {
+        switch error {
+        case .network:
+            return true
+        case .http(let status, _):
+            return status == 408 || status == 429 || (500...599).contains(status)
+        case .unauthorized, .conflict, .unknown:
+            return false
+        }
+    }
+
     private func armScheduledPauseActivation(
         _ runtime: ScheduledPauseDeferral,
         userSettings: UserSettings,
         generation: UInt64,
         lang: String
     ) async {
+        let supportsActivationWake =
+            runtime.phase == .activationScheduled || runtime.phase == .awaitingCheckout
         guard generation == scheduledPauseGeneration,
-              runtime.phase == .activationScheduled,
+              supportsActivationWake,
               let dueAt = runtime.activationAt,
               dueAt < runtime.windowEnd else { return }
         pauseActivationTask?.cancel()
         appRefreshScheduler.schedulePauseActivation(at: dueAt)
         armScheduledPauseTransition(at: runtime.windowEnd)
-        // Não há notificação antecipada durante grace: um CHECKIN em outro cliente pode ocorrer antes
-        // do vencimento. A mensagem só é postada após o GET fresco confirmar a ativação.
+        // Não há notificação antecipada durante grace/retry de confirmação: um CHECKIN em outro cliente
+        // pode ocorrer antes do vencimento. A mensagem só é postada após o GET fresco confirmar a ativação.
         await pauseAlarms.scheduleStart(at: nil, notify: false, lang: lang)
         guard generation == scheduledPauseGeneration,
               scheduledPauseDeferral?.id == runtime.id,
@@ -928,7 +1011,7 @@ actor BackgroundCheckOrchestrator {
     private func scheduledPauseActivationTaskFired(runtimeID: String, dueEpochMs: Int64) async {
         guard let runtime = scheduledPauseDeferral,
               runtime.id == runtimeID,
-              runtime.phase == .activationScheduled,
+              (runtime.phase == .activationScheduled || runtime.phase == .awaitingCheckout),
               runtime.activationEpochMs == dueEpochMs else { return }
         pauseActivationTask = nil
         if isRunning {
@@ -1260,16 +1343,19 @@ actor BackgroundCheckOrchestrator {
         for waiter in waiters { waiter.resume() }
     }
 
-    /// A edição preserva uma pausa já ACTIVE (ela termina/reconcilia no próximo run), mas invalida uma
-    /// decisão pendente baseada na configuração anterior.
+    /// A edição preserva uma pausa já ACTIVE até avaliar a configuração nova, invalida qualquer decisão
+    /// pendente anterior e garante a reconciliação imediata. O pedido fica pendente se outra run estiver
+    /// em voo; assim a mudança não depende de um futuro evento de localização/foreground.
     func scheduledPauseSettingsDidChange() async {
         await waitForAutomationContextInvalidationIfNeeded()
         scheduledPauseGeneration &+= 1
+        await restoreScheduledPauseDeferralIfNeeded()
         if scheduledPauseDeferral?.phase != .active {
             let lang = resolveEffectiveLanguageCode(await appPrefs.language())
             await cancelScheduledPauseRuntime(clearActiveFlag: false, lang: lang)
         }
-        if isRunning { pendingPauseReconciliation = true }
+        pendingPauseReconciliation = true
+        await runOnce(.foreground)
     }
 
     // MARK: - Episódio de baixa precisão
@@ -1499,13 +1585,14 @@ actor BackgroundCheckOrchestrator {
         }
         if pendingPauseActivation {
             pendingPauseActivation = false
-            if scheduledPauseDeferral?.phase == .activationScheduled {
+            let phase = scheduledPauseDeferral?.phase
+            if scheduledPauseDeferral?.activationAt != nil,
+               (phase == .activationScheduled || phase == .awaitingCheckout) {
                 await runOnce(.pauseActivation)
                 return
             }
         }
         if pendingPauseReconciliation {
-            pendingPauseReconciliation = false
             await runOnce(.foreground)
             return
         }

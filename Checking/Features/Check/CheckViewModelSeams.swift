@@ -19,7 +19,7 @@ protocol OrchestratorRunning: Sendable {
     func invalidateAccuracyRetry() async
     /// Troca de chave/projeto/toggle invalida todos os trabalhos ligados ao contexto anterior.
     func invalidateAutomationContext() async
-    /// Edição da configuração invalida somente um adiamento ainda não ativado.
+    /// Edição da configuração invalida somente um adiamento ainda não ativado e reconcilia a pausa.
     func scheduledPauseSettingsDidChange() async
     /// Um submit aceito só é confirmado pelo `HistoryState` devolvido pelo servidor.
     func acceptedCheck(
@@ -36,7 +36,9 @@ extension OrchestratorRunning {
     func invalidateAutomationContext() async {
         await invalidateAccuracyRetry()
     }
-    func scheduledPauseSettingsDidChange() async {}
+    func scheduledPauseSettingsDidChange() async {
+        await runOnce(.foreground)
+    }
     func acceptedCheck(
         chave: String,
         project: String,

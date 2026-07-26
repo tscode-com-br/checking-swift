@@ -59,6 +59,284 @@ final class ScheduledPauseDeferralTests: XCTestCase {
             transportEnabled: false)
     }
 
+    private func updateSettings(
+        _ prefs: FakeAppPreferences,
+        _ update: (inout UserSettings) -> Void
+    ) {
+        var map = try! JSONCoding.decoder.decode(
+            [String: UserSettings].self,
+            from: Data(prefs.userSettingsJsonValue.utf8))
+        var settings = map["HR70"]!
+        update(&settings)
+        map["HR70"] = settings
+        prefs.userSettingsJsonValue = String(
+            data: try! JSONCoding.encoder.encode(map),
+            encoding: .utf8)!
+    }
+
+    private func sundayAtNoon() -> Date {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = Calendar.current.timeZone
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        return calendar.date(from: DateComponents(
+            timeZone: calendar.timeZone,
+            year: 2026,
+            month: 7,
+            day: 26,
+            hour: 12))!
+    }
+
+    func test_togglingCurrentSundayOffThenOn_reconcilesAndNotifiesImmediately() async {
+        let now = sundayAtNoon()
+        let clock = MutableClock(now)
+        let prefs = preferences(pauseEnabled: false, from: "00:00", to: "00:00")
+        updateSettings(prefs) { $0.suspendSundays = true }
+        let repository = FakeCheckRepository()
+        repository.getStateResult = .success(
+            state(.checkOut, at: now.addingTimeInterval(-2 * 24 * 60 * 60)))
+        let notifications = SpyNotifications()
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            notifications: notifications,
+            clock: clock)
+
+        await sut.runOnce(.pauseTransition)
+        var isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        XCTAssertTrue(isPaused)
+        XCTAssertEqual(notifications.pausePosts.map(\.started), [true])
+
+        updateSettings(prefs) { $0.suspendSundays = false }
+        await sut.scheduledPauseSettingsDidChange()
+        isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        XCTAssertFalse(isPaused)
+        XCTAssertEqual(notifications.pausePosts.map(\.started), [true, false])
+
+        clock.advance(10 * 60)
+        updateSettings(prefs) { $0.suspendSundays = true }
+        await sut.scheduledPauseSettingsDidChange()
+
+        isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        XCTAssertTrue(isPaused)
+        XCTAssertTrue(prefs.scheduledPauseDeferralJsonValue.contains("\"phase\":\"active\""))
+        XCTAssertEqual(notifications.pausePosts.map(\.started), [true, false, true])
+    }
+
+    func test_sundaySettingChangeWhileAnotherRunIsInFlight_isDrainedWithoutForegroundEvent() async {
+        let now = sundayAtNoon()
+        let prefs = preferences(pauseEnabled: false, from: "00:00", to: "00:00")
+        let chaveGate = AsyncGate()
+        prefs.chaveGate = chaveGate
+        let repository = FakeCheckRepository()
+        repository.getStateResult = .success(
+            state(.checkOut, at: now.addingTimeInterval(-2 * 24 * 60 * 60)))
+        let notifications = SpyNotifications()
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            notifications: notifications,
+            clock: FixedClock(now))
+
+        let occupiedRun = Task { await sut.runOnce(.timer) }
+        await waitUntil { await sut.isRunningForTest }
+
+        updateSettings(prefs) { $0.suspendSundays = true }
+        await sut.scheduledPauseSettingsDidChange()
+        XCTAssertTrue(notifications.pausePosts.isEmpty)
+
+        await chaveGate.release()
+        await occupiedRun.value
+        await waitUntil { await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive) }
+
+        let isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        XCTAssertTrue(isPaused)
+        XCTAssertEqual(notifications.pausePosts.map(\.started), [true])
+    }
+
+    func test_pauseReconciliationSurvivesAccuracyInvalidationAcrossAwait() async {
+        let now = sundayAtNoon()
+        let prefs = preferences(pauseEnabled: false, from: "00:00", to: "00:00")
+        updateSettings(prefs) { $0.suspendSundays = true }
+        let chaveGate = AsyncGate()
+        prefs.chaveGate = chaveGate
+        let repository = FakeCheckRepository()
+        repository.getStateResult = .success(
+            state(.checkOut, at: now.addingTimeInterval(-2 * 24 * 60 * 60)))
+        let notifications = SpyNotifications()
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            notifications: notifications,
+            clock: FixedClock(now))
+
+        let settingsChange = Task { await sut.scheduledPauseSettingsDidChange() }
+        await waitUntil { await sut.isRunningForTest }
+        await sut.invalidateAccuracyRetry()
+
+        await chaveGate.release()
+        await settingsChange.value
+        await waitUntil { await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive) }
+
+        let isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        XCTAssertTrue(isPaused)
+        XCTAssertEqual(notifications.pausePosts.map(\.started), [true])
+    }
+
+    func test_initialStateFailure_retriesAndStartsPauseWithoutForegroundEvent() async {
+        let now = iso("2026-06-18T09:09:09Z")
+        let clock = MutableClock(now)
+        let prefs = preferences()
+        let repository = FakeCheckRepository()
+        repository.queuedGetStateResults = [
+            .failure(.network),
+            .success(state(.checkOut, at: now.addingTimeInterval(-24 * 60 * 60))),
+        ]
+        let notifications = SpyNotifications()
+        let sleeper = ControlledAccuracyRetrySleeper()
+        let scheduler = SpyAppRefreshScheduler()
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            notifications: notifications,
+            clock: clock,
+            pauseActivationSleeper: sleeper,
+            appRefreshScheduler: scheduler)
+
+        await sut.runOnce(.pauseTransition)
+        await waitUntil { await sleeper.waitingCount() == 1 }
+
+        var isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        let firstActivationAt = await sut.scheduledPauseActivationAtForTest
+        XCTAssertFalse(isPaused)
+        XCTAssertEqual(
+            firstActivationAt,
+            now.addingTimeInterval(BackgroundCheckOrchestrator.scheduledPauseActivationDelay))
+        XCTAssertEqual(
+            scheduler.scheduledPauseDates.last,
+            now.addingTimeInterval(BackgroundCheckOrchestrator.scheduledPauseActivationDelay))
+        XCTAssertTrue(prefs.scheduledPauseDeferralJsonValue.contains("\"phase\":\"awaitingCheckout\""))
+        XCTAssertTrue(notifications.pausePosts.isEmpty)
+
+        clock.advance(BackgroundCheckOrchestrator.scheduledPauseActivationDelay)
+        await sleeper.releaseNext()
+        await waitUntil { await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive) }
+
+        isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        XCTAssertTrue(isPaused)
+        XCTAssertEqual(notifications.pausePosts.map(\.started), [true])
+    }
+
+    func test_repeatedConfirmationFailure_backsOffToThreeMinutes() async {
+        let now = iso("2026-06-18T09:09:09Z")
+        let clock = MutableClock(now)
+        let prefs = preferences()
+        let repository = FakeCheckRepository()
+        repository.queuedGetStateResults = [
+            .failure(.network),
+            .failure(.network),
+        ]
+        let sleeper = ControlledAccuracyRetrySleeper()
+        let scheduler = SpyAppRefreshScheduler()
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            clock: clock,
+            pauseActivationSleeper: sleeper,
+            appRefreshScheduler: scheduler)
+
+        await sut.runOnce(.pauseTransition)
+        await waitUntil { await sleeper.waitingCount() == 1 }
+        clock.advance(BackgroundCheckOrchestrator.scheduledPauseActivationDelay)
+        await sleeper.releaseNext()
+
+        let expectedRetryAt = now.addingTimeInterval(
+            BackgroundCheckOrchestrator.scheduledPauseActivationDelay
+                + BackgroundCheckOrchestrator.scheduledPauseConfirmationBackoff)
+        await waitUntil {
+            let activationAt = await sut.scheduledPauseActivationAtForTest
+            let waitingCount = await sleeper.waitingCount()
+            return activationAt == expectedRetryAt && waitingCount == 1
+        }
+
+        let isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        let activationAt = await sut.scheduledPauseActivationAtForTest
+        XCTAssertFalse(isPaused)
+        XCTAssertEqual(activationAt, expectedRetryAt)
+        XCTAssertEqual(scheduler.scheduledPauseDates.last, expectedRetryAt)
+        await sut.invalidateAutomationContext()
+        await waitUntil { await sleeper.waitingCount() == 0 }
+    }
+
+    func test_unauthorizedStateFailure_reliesOnReauthenticationWithoutTightRetryLoop() async {
+        let now = iso("2026-06-18T09:09:09Z")
+        let prefs = preferences()
+        let repository = FakeCheckRepository()
+        repository.getStateResult = .failure(.unauthorized)
+        let notifications = SpyNotifications()
+        let sleeper = ControlledAccuracyRetrySleeper()
+        let scheduler = SpyAppRefreshScheduler()
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            notifications: notifications,
+            clock: FixedClock(now),
+            pauseActivationSleeper: sleeper,
+            appRefreshScheduler: scheduler)
+
+        await sut.runOnce(.pauseTransition)
+
+        let activationAt = await sut.scheduledPauseActivationAtForTest
+        let waitingCount = await sleeper.waitingCount()
+        let isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        XCTAssertNil(activationAt)
+        XCTAssertEqual(waitingCount, 0)
+        XCTAssertFalse(isPaused)
+        XCTAssertTrue(scheduler.scheduledPauseDates.isEmpty)
+        XCTAssertEqual(notifications.reauthPosts, ["pt"])
+    }
+
+    func test_confirmationRetry_reanchorsGraceToNewerCheckoutTimestamp() async {
+        let now = iso("2026-06-18T09:09:09Z")
+        let clock = MutableClock(now)
+        let prefs = preferences()
+        let repository = FakeCheckRepository()
+        let recentCheckoutAt = now.addingTimeInterval(8)
+        repository.queuedGetStateResults = [.failure(.network)]
+        repository.getStateResult = .success(state(.checkOut, at: recentCheckoutAt))
+        let notifications = SpyNotifications()
+        let sleeper = ControlledAccuracyRetrySleeper()
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            notifications: notifications,
+            clock: clock,
+            pauseActivationSleeper: sleeper)
+
+        await sut.runOnce(.pauseTransition)
+        await waitUntil { await sleeper.waitingCount() == 1 }
+        clock.advance(BackgroundCheckOrchestrator.scheduledPauseActivationDelay)
+        await sleeper.releaseNext()
+        await waitUntil {
+            let activationAt = await sut.scheduledPauseActivationAtForTest
+            let waitingCount = await sleeper.waitingCount()
+            return activationAt == recentCheckoutAt.addingTimeInterval(
+                BackgroundCheckOrchestrator.scheduledPauseActivationDelay)
+                && waitingCount == 1
+        }
+
+        var isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        XCTAssertFalse(isPaused)
+        XCTAssertTrue(notifications.pausePosts.isEmpty)
+
+        clock.advance(8)
+        await sleeper.releaseNext()
+        await waitUntil { await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive) }
+
+        isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        XCTAssertTrue(isPaused)
+        XCTAssertEqual(notifications.pausePosts.map(\.started), [true])
+    }
+
     func test_checkoutThatPredatesWindow_startsPauseImmediately() async {
         let now = iso("2026-06-18T09:09:09Z")
         let prefs = preferences()
@@ -108,11 +386,15 @@ final class ScheduledPauseDeferralTests: XCTestCase {
         repository.getStateResult = .success(state(.checkIn, at: now))
         let auto = SpyAutoActivities()
         auto.result = .accuracyTooLow(expectedAction: .checkOut)
+        let alarms = SpyPauseAlarmScheduler()
+        let scheduler = SpyAppRefreshScheduler()
         let sut = makeOrchestrator(
             prefs: prefs,
             checkRepository: repository,
             autoActivities: auto,
-            clock: FixedClock(now))
+            clock: FixedClock(now),
+            pauseAlarms: alarms,
+            appRefreshScheduler: scheduler)
 
         await sut.runOnce(.pauseTransition)
 
@@ -124,6 +406,9 @@ final class ScheduledPauseDeferralTests: XCTestCase {
         XCTAssertTrue(hasDeferral)
         XCTAssertTrue(hasAccuracyRetry)
         XCTAssertTrue(prefs.scheduledPauseDeferralJsonValue.contains("\"phase\":\"awaitingCheckout\""))
+        XCTAssertGreaterThan(scheduler.clearPauseDeadlineCount, 0)
+        XCTAssertNil(alarms.startCalls.last?.date)
+        XCTAssertNil(alarms.resumeCalls.last?.date)
     }
 
     func test_checkoutInsideWindow_schedulesTenSecondGrace_withoutStartNotificationAlarm() async {
@@ -234,6 +519,89 @@ final class ScheduledPauseDeferralTests: XCTestCase {
         let isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
         XCTAssertTrue(isPaused)
         XCTAssertTrue(prefs.scheduledPauseDeferralJsonValue.contains("\"phase\":\"active\""))
+    }
+
+    func test_graceVerificationFailures_useFastRetryThenThreeMinuteBackoff() async {
+        let now = iso("2026-06-18T09:09:09Z")
+        let clock = MutableClock(now)
+        let prefs = preferences()
+        let repository = FakeCheckRepository()
+        repository.getStateResult = .success(state(.checkOut, at: now))
+        let sleeper = ControlledAccuracyRetrySleeper()
+        let scheduler = SpyAppRefreshScheduler()
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            clock: clock,
+            pauseActivationSleeper: sleeper,
+            appRefreshScheduler: scheduler)
+        await sut.runOnce(.pauseTransition)
+        await waitUntil { await sleeper.waitingCount() == 1 }
+
+        repository.queuedGetStateResults = [
+            .failure(.network),
+            .failure(.network),
+        ]
+        clock.advance(BackgroundCheckOrchestrator.scheduledPauseActivationDelay)
+        await sleeper.releaseNext()
+        let fastRetryAt = now.addingTimeInterval(
+            2 * BackgroundCheckOrchestrator.scheduledPauseActivationDelay)
+        await waitUntil {
+            let activationAt = await sut.scheduledPauseActivationAtForTest
+            let waitingCount = await sleeper.waitingCount()
+            return activationAt == fastRetryAt && waitingCount == 1
+        }
+
+        clock.advance(BackgroundCheckOrchestrator.scheduledPauseActivationDelay)
+        await sleeper.releaseNext()
+        let backedOffRetryAt = fastRetryAt.addingTimeInterval(
+            BackgroundCheckOrchestrator.scheduledPauseConfirmationBackoff)
+        await waitUntil {
+            let activationAt = await sut.scheduledPauseActivationAtForTest
+            let waitingCount = await sleeper.waitingCount()
+            return activationAt == backedOffRetryAt && waitingCount == 1
+        }
+
+        let isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        XCTAssertFalse(isPaused)
+        XCTAssertEqual(scheduler.scheduledPauseDates.last, backedOffRetryAt)
+        await sut.invalidateAutomationContext()
+        await waitUntil { await sleeper.waitingCount() == 0 }
+    }
+
+    func test_graceUnauthorizedFailure_stopsWakeAndUsesReauthenticationFlow() async {
+        let now = iso("2026-06-18T09:09:09Z")
+        let clock = MutableClock(now)
+        let prefs = preferences()
+        let repository = FakeCheckRepository()
+        repository.getStateResult = .success(state(.checkOut, at: now))
+        let notifications = SpyNotifications()
+        let sleeper = ControlledAccuracyRetrySleeper()
+        let scheduler = SpyAppRefreshScheduler()
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            notifications: notifications,
+            clock: clock,
+            pauseActivationSleeper: sleeper,
+            appRefreshScheduler: scheduler)
+        await sut.runOnce(.pauseTransition)
+        await waitUntil { await sleeper.waitingCount() == 1 }
+
+        repository.getStateResult = .failure(.unauthorized)
+        clock.advance(BackgroundCheckOrchestrator.scheduledPauseActivationDelay)
+        await sleeper.releaseNext()
+        await waitUntil { notifications.reauthPosts == ["pt"] }
+
+        let activationAt = await sut.scheduledPauseActivationAtForTest
+        let waitingCount = await sleeper.waitingCount()
+        let isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+        XCTAssertNil(activationAt)
+        XCTAssertEqual(waitingCount, 0)
+        XCTAssertFalse(isPaused)
+        XCTAssertEqual(scheduler.scheduledPauseDates.count, 1)
+        XCTAssertEqual(notifications.reauthPosts, ["pt"])
+        XCTAssertTrue(prefs.scheduledPauseDeferralJsonValue.contains("\"phase\":\"awaitingCheckout\""))
     }
 
     func test_coldRestart_restoresGrace_andBGTriggerRevalidatesBeforeActivation() async {

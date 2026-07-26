@@ -238,6 +238,27 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         guard let aps = userInfo["aps"] as? [String: Any] else { return false }
         return (aps["category"] as? String) == accidentNotificationCategory
     }
+
+    nonisolated static func shouldOpenAccidentNotification(
+        actionIdentifier: String,
+        categoryIdentifier: String,
+        userInfo: [AnyHashable: Any]
+    ) -> Bool {
+        let isOpenAction = actionIdentifier == openAccidentAction
+            || actionIdentifier == UNNotificationDefaultActionIdentifier
+        guard isOpenAction else { return false }
+        return categoryIdentifier == accidentNotificationCategory || isAccidentPayload(userInfo)
+    }
+}
+
+/// A closure de conclusão vem de Objective-C e nem todos os SDKs usados pelo projeto a importam
+/// como `@Sendable`. O box atravessa somente a fronteira até a MainActor, onde a closure é chamada.
+private final class NotificationResponseCompletionBox: @unchecked Sendable {
+    let call: () -> Void
+
+    init(_ call: @escaping () -> Void) {
+        self.call = call
+    }
 }
 
 extension AppDelegate: UNUserNotificationCenterDelegate {
@@ -251,19 +272,26 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
 
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse
-    ) async {
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
         let content = response.notification.request.content
-        guard response.actionIdentifier == Self.openAccidentAction
-                || response.actionIdentifier == UNNotificationDefaultActionIdentifier,
-              content.categoryIdentifier == Self.accidentNotificationCategory
-                || Self.isAccidentPayload(content.userInfo)
-        else { return }
-        // Não alterar a árvore SwiftUI dentro do callback de resposta. Em iOS 26 esse callback pode
-        // coincidir com a captura/restauração do snapshot da cena; o build 25 abortou em
-        // `_updateStateRestorationArchiveForBackgroundEvent`. Enfileiramos a intenção e entregamos
-        // somente depois de a aplicação estar ativa e a transação inicial ter sido concluída.
-        await enqueueAccidentNotificationOpen()
+        let shouldOpenAccident = Self.shouldOpenAccidentNotification(
+            actionIdentifier: response.actionIdentifier,
+            categoryIdentifier: content.categoryIdentifier,
+            userInfo: content.userInfo
+        )
+        let completion = NotificationResponseCompletionBox(completionHandler)
+
+        // Não usar aqui a overload async do delegate: no Swift 6 sua ponte Objective-C pode concluir
+        // em uma worker thread. Em iOS 26, o UIKit então aborta ao atualizar o snapshot/restauração.
+        Task { @MainActor [weak self] in
+            // O sistema deve ser liberado logo após enfileirar a intenção; a entrega à UI mantém,
+            // separadamente, o atraso de estabilização de 350 ms.
+            defer { completion.call() }
+            guard shouldOpenAccident else { return }
+            self?.enqueueAccidentNotificationOpen()
+        }
     }
 }
 

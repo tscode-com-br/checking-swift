@@ -1375,9 +1375,9 @@ final class CheckViewModel {
             guard !Task.isCancelled else { return }
             if scheduledPauseChanged {
                 await orchestrator.scheduledPauseSettingsDidChange()
-                guard !Task.isCancelled else { return }
+            } else {
+                await orchestrator.runOnce(.foreground)
             }
-            await orchestrator.runOnce(.foreground)
         }
     }
 

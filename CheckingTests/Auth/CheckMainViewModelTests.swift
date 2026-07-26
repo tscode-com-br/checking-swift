@@ -528,6 +528,37 @@ final class CheckMainViewModelTests: XCTestCase {
         h.teardown()
     }
 
+    func test_scheduledPauseChangePersistsAndRequestsImmediateReconciliation() async {
+        let (h, vm) = await authenticatedHarness()
+        try? await Task.sleep(for: .milliseconds(50))
+        let initialRuns = h.orchestrator.runOnceCalls.count
+        let runGate = AsyncGate()
+        h.orchestrator.nextRunGate = runGate
+
+        vm.onScheduledPauseSettingChanged(
+            enabled: false,
+            from: "00:00",
+            to: "00:00",
+            suspendSat: false,
+            suspendSun: true)
+        await settle {
+            h.orchestrator.scheduledPauseSettingsChangeCount == 1
+                && h.orchestrator.runOnceCalls.count == initialRuns + 1
+        }
+        await runGate.release()
+        try? await Task.sleep(for: .milliseconds(50))
+
+        let map = try! JSONCoding.decoder.decode(
+            [String: UserSettings].self,
+            from: Data((await h.prefs.userSettingsJson()).utf8))
+        XCTAssertEqual(map["HR70"]?.suspendSundays, true)
+        XCTAssertEqual(h.orchestrator.scheduledPauseSettingsChangeCount, 1)
+        XCTAssertEqual(
+            h.orchestrator.runOnceCalls.dropFirst(initialRuns).filter { $0 == .foreground }.count,
+            1)
+        h.teardown()
+    }
+
     func test_historyDialogFiltersTappedActivity() async {
         let (h, vm) = await authenticatedHarness()
         h.checkRepository.getHistoryResult = .success([
