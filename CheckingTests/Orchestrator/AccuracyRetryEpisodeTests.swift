@@ -192,7 +192,6 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
         XCTAssertFalse(hasEpisodeAfterResolution)
         XCTAssertEqual(notifications.clearLowAccuracyCount, 1)
         XCTAssertEqual(backstop.clearRetryDeadlineCount, 1)
-        XCTAssertEqual(backstop.regularScheduleCount, 1)
     }
 
     func test_dueRetryIsPreservedWhileAnotherEvaluationRuns_andDrainedAfterItFinishes() async {
@@ -299,7 +298,6 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
             let hasEpisode = await sut.hasAccuracyRetryEpisodeForTest
             XCTAssertFalse(hasEpisode, "\(terminal)")
             XCTAssertEqual(backstop.clearRetryDeadlineCount, 1, "\(terminal)")
-            XCTAssertEqual(backstop.regularScheduleCount, 1, "\(terminal)")
             XCTAssertEqual(notifications.clearLowAccuracyCount, 1, "\(terminal)")
         }
     }
@@ -320,9 +318,17 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
 
         // Pausa programada.
         do {
+            let now = iso("2026-06-18T09:09:09Z")
             let prefs = activePreferences()
+            let repository = FakeCheckRepository()
+            repository.getStateResult = .success(
+                ucHistory(.checkOut, lastCheckoutAt: now))
             let auto = ScriptedAutoActivities([.accuracyTooLow(expectedAction: .checkIn)])
-            let sut = makeOrchestrator(prefs: prefs, autoActivities: auto)
+            let sut = makeOrchestrator(
+                prefs: prefs,
+                checkRepository: repository,
+                autoActivities: auto,
+                clock: FixedClock(now))
             await sut.runOnce(.foreground)
             let paused = activePreferences(scheduledPauseEnabled: true)
             prefs.userSettingsJsonValue = paused.userSettingsJsonValue
@@ -355,6 +361,64 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
             let hasEpisode = await sut.hasAccuracyRetryEpisodeForTest
             XCTAssertFalse(hasEpisode)
         }
+    }
+
+    func test_scheduledPauseAwaitingCheckoutPreservesEpisodeUntilAutomationCanCheckout() async {
+        let now = iso("2026-06-18T09:09:09Z")
+        let prefs = activePreferences()
+        let repository = FakeCheckRepository()
+        repository.getStateResult = .success(
+            ucHistory(.checkIn, currentLocal: "Unidade P80", lastCheckinAt: now))
+        let auto = ScriptedAutoActivities([
+            .accuracyTooLow(expectedAction: .checkOut),
+            .accuracyTooLow(expectedAction: .checkOut),
+        ])
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            autoActivities: auto,
+            clock: FixedClock(now))
+
+        await sut.runOnce(.foreground)
+        prefs.userSettingsJsonValue =
+            activePreferences(scheduledPauseEnabled: true).userSettingsJsonValue
+        await sut.runOnce(.foreground)
+
+        let hasEpisode = await sut.hasAccuracyRetryEpisodeForTest
+        XCTAssertTrue(hasEpisode)
+        XCTAssertEqual(auto.callCount, 2)
+        XCTAssertTrue(
+            prefs.scheduledPauseDeferralJsonValue.contains("\"phase\":\"awaitingCheckout\""))
+    }
+
+    func test_scheduledPauseStateFailurePreservesEpisodeAndDoesNotRunEngineBlindly() async {
+        let now = iso("2026-06-18T09:09:09Z")
+        let prefs = activePreferences()
+        let repository = FakeCheckRepository()
+        let scheduler = SpyAppRefreshScheduler()
+        let auto = ScriptedAutoActivities([.accuracyTooLow(expectedAction: .checkIn)])
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            autoActivities: auto,
+            clock: FixedClock(now),
+            appRefreshScheduler: scheduler)
+
+        await sut.runOnce(.foreground)
+        repository.getStateResult = .failure(.network)
+        prefs.userSettingsJsonValue =
+            activePreferences(scheduledPauseEnabled: true).userSettingsJsonValue
+        await sut.runOnce(.foreground)
+
+        let hasEpisode = await sut.hasAccuracyRetryEpisodeForTest
+        XCTAssertTrue(hasEpisode)
+        XCTAssertEqual(auto.callCount, 1)
+        XCTAssertEqual(
+            scheduler.scheduledPauseDates.last,
+            now.addingTimeInterval(
+                BackgroundCheckOrchestrator.scheduledPauseActivationDelay))
+        XCTAssertTrue(
+            prefs.scheduledPauseDeferralJsonValue.contains("\"phase\":\"awaitingCheckout\""))
     }
 
     func test_timerBypassesMovementSkipDuringEpisode() async {
@@ -542,7 +606,6 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
 
         XCTAssertTrue(prefs.accuracyRetryEpisodeJsonValue.isEmpty)
         XCTAssertEqual(scheduler.clearRetryDeadlineCount, 1)
-        XCTAssertEqual(scheduler.regularScheduleCount, 1)
         XCTAssertEqual(notifications.lowAccuracyPosts.count, 0)
         XCTAssertEqual(notifications.clearLowAccuracyCount, 1)
 
@@ -581,7 +644,6 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
         XCTAssertEqual(restoredAuto.callCount, 1)
         XCTAssertTrue(prefs.accuracyRetryEpisodeJsonValue.isEmpty)
         XCTAssertEqual(restoredBackstop.clearRetryDeadlineCount, 1)
-        XCTAssertEqual(restoredBackstop.regularScheduleCount, 1)
         XCTAssertEqual(restoredNotifications.lowAccuracyPosts.count, 0)
         XCTAssertEqual(restoredNotifications.clearLowAccuracyCount, 1)
 

@@ -8,7 +8,7 @@ TARGETED_DEVICE_FAMILY = 1
 
 // Nova versão TestFlight: a combinação versão + build é única no App Store Connect.
 MARKETING_VERSION = 1.6.6
-CURRENT_PROJECT_VERSION = 2
+CURRENT_PROJECT_VERSION = 3
 
 // Backend (sem esquema; o código monta https://{host}{prefix}/ — port_spec_network_contracts §1).
 CHECKING_API_HOST = tscode.com.br

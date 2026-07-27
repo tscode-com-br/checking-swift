@@ -142,10 +142,7 @@ final class SpyAppRefreshScheduler: AppRefreshScheduling, @unchecked Sendable {
         return nil
     }
     func clearAccuracyRetryDeadlineAndScheduleRegular() -> String? {
-        lock.withLock {
-            clearedRetryDeadlines += 1
-            regularSchedules += 1
-        }
+        lock.withLock { clearedRetryDeadlines += 1 }
         return nil
     }
     func schedulePauseActivation(at deadline: Date) -> String? {
@@ -153,10 +150,7 @@ final class SpyAppRefreshScheduler: AppRefreshScheduling, @unchecked Sendable {
         return nil
     }
     func clearPauseActivationDeadlineAndScheduleRegular() -> String? {
-        lock.withLock {
-            clearedPauseDeadlines += 1
-            regularSchedules += 1
-        }
+        lock.withLock { clearedPauseDeadlines += 1 }
         return nil
     }
     func schedulePauseTransition(at deadline: Date) -> String? {
@@ -164,10 +158,7 @@ final class SpyAppRefreshScheduler: AppRefreshScheduling, @unchecked Sendable {
         return nil
     }
     func clearPauseTransitionDeadlineAndScheduleRegular() -> String? {
-        lock.withLock {
-            clearedTransitionDeadlines += 1
-            regularSchedules += 1
-        }
+        lock.withLock { clearedTransitionDeadlines += 1 }
         return nil
     }
     func triggerForPendingRefresh() -> OrchestratorTrigger {

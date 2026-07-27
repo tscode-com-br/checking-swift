@@ -431,7 +431,11 @@ final class CheckMainViewModelTests: XCTestCase {
         XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 0)
 
         await enqueueGate.release()
-        await settle { !h.offlineQueue.enqueued.isEmpty }
+        await settle {
+            !h.offlineQueue.enqueued.isEmpty
+                && h.orchestrator.invalidateAccuracyRetryCount == 1
+                && vm.uiState.notificationPrimary == t("status.savedOffline", lang: "pt")
+        }
 
         let submitted = try! XCTUnwrap(h.checkRepository.submitCalls.first)
         guard case .decided(let queued) = try! XCTUnwrap(h.offlineQueue.enqueued.first) else {

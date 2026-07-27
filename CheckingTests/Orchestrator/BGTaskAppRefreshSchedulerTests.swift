@@ -20,6 +20,42 @@ final class BGTaskAppRefreshSchedulerTests: XCTestCase {
         var all: [Date] { lock.withLock { values } }
     }
 
+    private final class LockedCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+
+        func increment() { lock.withLock { count += 1 } }
+        var value: Int { lock.withLock { count } }
+    }
+
+    private final class PendingRequestProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pending: Bool
+        private var cancellations = 0
+        private var submissions: [Date] = []
+
+        init(pending: Bool) { self.pending = pending }
+
+        func cancel() {
+            lock.withLock {
+                pending = false
+                cancellations += 1
+            }
+        }
+
+        func submit(_ deadline: Date) -> String? {
+            lock.withLock {
+                guard !pending else { return "BGTaskSchedulerErrorDomain Code=2" }
+                pending = true
+                submissions.append(deadline)
+                return nil
+            }
+        }
+
+        var cancelCount: Int { lock.withLock { cancellations } }
+        var submittedDates: [Date] { lock.withLock { submissions } }
+    }
+
     private func makeDefaults() -> (suite: String, defaults: UserDefaults) {
         let suite = "bg_refresh_scheduler_\(UUID().uuidString)"
         return (suite, UserDefaults(suiteName: suite)!)
@@ -43,6 +79,96 @@ final class BGTaskAppRefreshSchedulerTests: XCTestCase {
         XCTAssertEqual(submitted.all, [now.get().addingTimeInterval(15 * 60)])
     }
 
+    func test_repeatedRegularRefreshIsIdempotentWhileEarlierRequestIsPending() {
+        let storage = makeDefaults()
+        defer { storage.defaults.removePersistentDomain(forName: storage.suite) }
+        let current = iso("2026-06-18T12:00:00Z")
+        let probe = PendingRequestProbe(pending: false)
+        let sut = BGTaskAppRefreshScheduler(
+            defaults: storage.defaults,
+            now: { current },
+            cancelPendingRequest: { probe.cancel() },
+            submitRequest: { probe.submit($0) })
+
+        sut.scheduleRegularRefresh()
+        sut.scheduleRegularRefresh()
+        sut.clearPauseTransitionDeadlineAndScheduleRegular()
+
+        XCTAssertEqual(probe.cancelCount, 1)
+        XCTAssertEqual(probe.submittedDates, [current.addingTimeInterval(15 * 60)])
+    }
+
+    func test_newSchedulerInstanceReconfirmsRequestInsteadOfTrustingStaleProcessCache() {
+        let storage = makeDefaults()
+        defer { storage.defaults.removePersistentDomain(forName: storage.suite) }
+        let current = iso("2026-06-18T12:00:00Z")
+        let firstProbe = PendingRequestProbe(pending: false)
+        let first = BGTaskAppRefreshScheduler(
+            defaults: storage.defaults,
+            now: { current },
+            cancelPendingRequest: { firstProbe.cancel() },
+            submitRequest: { firstProbe.submit($0) })
+        first.scheduleRegularRefresh()
+
+        let relaunchedProbe = PendingRequestProbe(pending: true)
+        let relaunched = BGTaskAppRefreshScheduler(
+            defaults: storage.defaults,
+            now: { current },
+            cancelPendingRequest: { relaunchedProbe.cancel() },
+            submitRequest: { relaunchedProbe.submit($0) })
+        let error = relaunched.scheduleRegularRefresh()
+
+        XCTAssertNil(error)
+        XCTAssertEqual(relaunchedProbe.cancelCount, 1)
+        XCTAssertEqual(
+            relaunchedProbe.submittedDates,
+            [current.addingTimeInterval(15 * 60)])
+    }
+
+    func test_existingPlatformRequestIsCancelledBeforeReplacementSubmission() {
+        let storage = makeDefaults()
+        defer { storage.defaults.removePersistentDomain(forName: storage.suite) }
+        let current = iso("2026-06-18T12:00:00Z")
+        let probe = PendingRequestProbe(pending: true)
+        let sut = BGTaskAppRefreshScheduler(
+            defaults: storage.defaults,
+            now: { current },
+            cancelPendingRequest: { probe.cancel() },
+            submitRequest: { probe.submit($0) })
+
+        let error = sut.scheduleRegularRefresh()
+
+        XCTAssertNil(error)
+        XCTAssertEqual(probe.cancelCount, 1)
+        XCTAssertEqual(probe.submittedDates, [current.addingTimeInterval(15 * 60)])
+    }
+
+    func test_failedSubmissionIsReturnedAndRetriedBecauseItIsNotMarkedPending() {
+        let storage = makeDefaults()
+        defer { storage.defaults.removePersistentDomain(forName: storage.suite) }
+        let current = iso("2026-06-18T12:00:00Z")
+        let submitted = SubmittedDates()
+        let cancellations = LockedCounter()
+        let sut = BGTaskAppRefreshScheduler(
+            defaults: storage.defaults,
+            now: { current },
+            cancelPendingRequest: { cancellations.increment() },
+            submitRequest: {
+                submitted.append($0)
+                return "BGTaskSchedulerErrorDomain Code=2"
+            })
+
+        let firstError = sut.scheduleRegularRefresh()
+        let secondError = sut.scheduleRegularRefresh()
+
+        XCTAssertEqual(firstError, "BGTaskSchedulerErrorDomain Code=2")
+        XCTAssertEqual(secondError, firstError)
+        XCTAssertEqual(cancellations.value, 2)
+        XCTAssertEqual(
+            submitted.all,
+            [current.addingTimeInterval(15 * 60), current.addingTimeInterval(15 * 60)])
+    }
+
     func test_threeMinuteRetryIsPersistedAndNotOverwrittenByRegularReschedule() {
         let storage = makeDefaults()
         defer { storage.defaults.removePersistentDomain(forName: storage.suite) }
@@ -61,7 +187,7 @@ final class BGTaskAppRefreshSchedulerTests: XCTestCase {
         sut.scheduleAccuracyRetry(at: retry)
         sut.scheduleRegularRefresh()
 
-        XCTAssertEqual(submitted.all, [retry, retry])
+        XCTAssertEqual(submitted.all, [retry])
         XCTAssertNotNil(
             storage.defaults.object(
                 forKey: BGTaskAppRefreshScheduler.accuracyRetryDeadlineDefaultsKey))
@@ -150,7 +276,7 @@ final class BGTaskAppRefreshSchedulerTests: XCTestCase {
         sut.schedulePauseActivation(at: grace)
         sut.scheduleRegularRefresh()
 
-        XCTAssertEqual(submitted.all, [accuracy, transition, grace, grace])
+        XCTAssertEqual(submitted.all, [accuracy, transition, grace])
     }
 
     func test_duePauseTransitionHasPriority_thenDueGrace_thenAccuracy() {
