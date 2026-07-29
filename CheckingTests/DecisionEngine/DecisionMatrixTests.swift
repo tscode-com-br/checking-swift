@@ -117,4 +117,67 @@ final class DecisionMatrixTests: XCTestCase {
         XCTAssertFalse(shouldAttemptAutomaticMixedZoneLocationEvent(match(.matched, "Zona Mista"), within, settings))
         XCTAssertTrue(shouldAttemptAutomaticMixedZoneLocationEvent(match(.matched, "Zona Mista"), after, settings))
     }
+    func test_s8_mixed_zone_real_incident_25_seconds_after_checkin_is_suppressed() {
+        let settings = MixedZoneDecisionSettings(mixedZoneIntervalMinutes: 30, referenceTime: now)
+        let stateAfterCheckin = state(
+            .checkIn,
+            currentLocal: "Escritório Principal",
+            lastCheckinAt: now.addingTimeInterval(-25)
+        )
+
+        XCTAssertFalse(
+            shouldAttemptAutomaticMixedZoneLocationEvent(
+                match(.matched, "Zona Mista"),
+                stateAfterCheckin,
+                settings
+            )
+        )
+    }
+    func test_s8_mixed_zone_exact_cooldown_boundary_allows_toggle() {
+        let settings = MixedZoneDecisionSettings(mixedZoneIntervalMinutes: 15, referenceTime: now)
+        let atBoundary = state(
+            .checkIn,
+            currentLocal: "Unidade P80",
+            lastCheckinAt: now.addingTimeInterval(-15 * 60)
+        )
+
+        XCTAssertTrue(
+            shouldAttemptAutomaticMixedZoneLocationEvent(
+                match(.matched, "Zona Mista"),
+                atBoundary,
+                settings
+            )
+        )
+    }
+    func test_s8_mixed_zone_without_previous_activity_allows_initial_checkin() {
+        let noActivity = HistoryState(
+            found: true, chave: "STM1", projeto: "P80", currentAction: nil, currentLocal: nil,
+            hasCurrentDayCheckin: false, lastCheckinAt: nil, lastCheckoutAt: nil, transportEnabled: false
+        )
+        let settings = MixedZoneDecisionSettings(mixedZoneIntervalMinutes: 15, referenceTime: now)
+
+        XCTAssertTrue(
+            shouldAttemptAutomaticMixedZoneLocationEvent(
+                match(.matched, "Zona Mista"),
+                noActivity,
+                settings
+            )
+        )
+    }
+    func test_s8_mixed_zone_branch_a_checkout_within_cooldown_remains_suppressed() {
+        let settings = MixedZoneDecisionSettings(mixedZoneIntervalMinutes: 15, referenceTime: now)
+        let recentCheckout = state(
+            .checkOut,
+            currentLocal: "Zona Mista",
+            lastCheckoutAt: now.addingTimeInterval(-5 * 60)
+        )
+
+        XCTAssertFalse(
+            shouldAttemptAutomaticMixedZoneLocationEvent(
+                match(.matched, "Zona Mista"),
+                recentCheckout,
+                settings
+            )
+        )
+    }
 }

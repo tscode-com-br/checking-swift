@@ -85,6 +85,58 @@ final class AutoActivitiesHelpersTests: XCTestCase {
     func test_mixedZoneCooldown_notInMixedZone_returnsFalse() { XCTAssertFalse(isMixedZoneCooldownActive(checkedInState("Office A"), 30)) }
     func test_mixedZoneCooldown_zeroCooldown_returnsFalse() { XCTAssertFalse(isMixedZoneCooldownActive(checkedInState("Zona Mista"), 0)) }
 
+    // ── temp006: cooldown da última atividade em qualquer localização ──
+    func test_resolveLastRecordedActivityTimestamp_returnsLatestCheckinTimestamp() {
+        XCTAssertEqual(
+            resolveLastRecordedActivityTimestamp(checkedInState(lastCheckinAt: t2, lastCheckoutAt: t1)),
+            t2
+        )
+    }
+    func test_resolveLastRecordedActivityTimestamp_returnsLatestCheckoutTimestamp() {
+        XCTAssertEqual(
+            resolveLastRecordedActivityTimestamp(checkedOutState(lastCheckinAt: t1, lastCheckoutAt: t2)),
+            t2
+        )
+    }
+    func test_resolveLastRecordedActivityTimestamp_withoutRecordedTimestamp_returnsNil() {
+        let state = HistoryState(
+            found: true, chave: "T", projeto: nil, currentAction: .checkIn, currentLocal: "Office A",
+            hasCurrentDayCheckin: true, lastCheckinAt: nil, lastCheckoutAt: nil, transportEnabled: false
+        )
+        XCTAssertNil(resolveLastRecordedActivityTimestamp(state))
+    }
+    func test_mixedZoneCooldownForLastActivity_withinWindow_returnsTrue() {
+        XCTAssertTrue(isMixedZoneCooldownActiveForLastActivity(
+            checkedInState("Office A", lastCheckinAt: t1),
+            30,
+            t1.addingTimeInterval(20 * 60)
+        ))
+    }
+    func test_mixedZoneCooldownForLastActivity_afterWindow_returnsFalse() {
+        XCTAssertFalse(isMixedZoneCooldownActiveForLastActivity(
+            checkedOutState("Zona de CheckOut", lastCheckoutAt: t1),
+            30,
+            t1.addingTimeInterval(40 * 60)
+        ))
+    }
+    func test_mixedZoneCooldownForLastActivity_atExactBoundary_returnsFalse() {
+        XCTAssertFalse(isMixedZoneCooldownActiveForLastActivity(
+            checkedInState("Office A", lastCheckinAt: t1),
+            30,
+            t1.addingTimeInterval(30 * 60)
+        ))
+    }
+    func test_mixedZoneCooldownForLastActivity_invalidInterval_returnsFalse() {
+        XCTAssertFalse(isMixedZoneCooldownActiveForLastActivity(checkedInState(), 0, t1))
+    }
+    func test_mixedZoneCooldownForLastActivity_withoutTimestamp_returnsFalse() {
+        let state = HistoryState(
+            found: true, chave: "T", projeto: nil, currentAction: .checkOut, currentLocal: "Office A",
+            hasCurrentDayCheckin: false, lastCheckinAt: nil, lastCheckoutAt: nil, transportEnabled: false
+        )
+        XCTAssertFalse(isMixedZoneCooldownActiveForLastActivity(state, 30, t1))
+    }
+
     // ── normalizeLocationName / isCheckoutZone / isMixedZone ──
     func test_normalizeLocationName_trimsCaseAndExtraSpaces() { XCTAssertEqual(normalizeLocationName("  Zona  Mista  "), "zona mista") }
     func test_normalizeLocationName_nullReturnsEmpty() { XCTAssertEqual(normalizeLocationName(nil), "") }
