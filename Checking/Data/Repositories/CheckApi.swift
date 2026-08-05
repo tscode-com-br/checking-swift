@@ -11,4 +11,39 @@ protocol CheckApi: Sendable {
     func matchLocation(_ body: WebLocationMatchRequest) async throws -> WebLocationMatchResponse  // POST check/location
     func getGeofences(_ chave: String) async throws -> WebGeofencesResponse           // GET  check/geofences?chave
     func submit(_ body: WebCheckSubmitRequest) async throws -> MobileSubmitResponse   // POST check
+
+    /// Variantes exclusivas do motor automático. `notDispatched` é distinto de uma falha HTTP e prova
+    /// que a revogação venceu antes do início do request; os contratos de body/path permanecem os mesmos.
+    func matchLocation(
+        _ body: WebLocationMatchRequest,
+        dispatchAuthorization: HTTPRequestDispatchAuthorization
+    ) async throws -> GuardedOperationResult<WebLocationMatchResponse>
+    func submit(
+        _ body: WebCheckSubmitRequest,
+        dispatchAuthorization: HTTPRequestDispatchAuthorization
+    ) async throws -> GuardedOperationResult<MobileSubmitResponse>
+}
+
+extension CheckApi {
+    /// Compatibilidade para fakes/adapters: cria a chamada antiga dentro do ponto de linearização.
+    /// `CheckApiLive` sobrescreve estas variantes e lineariza o `URLSessionDataTask.resume()` real.
+    func matchLocation(
+        _ body: WebLocationMatchRequest,
+        dispatchAuthorization: HTTPRequestDispatchAuthorization
+    ) async throws -> GuardedOperationResult<WebLocationMatchResponse> {
+        try await runGuardedAsyncOperation(
+            authorization: dispatchAuthorization,
+            operation: { try await self.matchLocation(body) }
+        )
+    }
+
+    func submit(
+        _ body: WebCheckSubmitRequest,
+        dispatchAuthorization: HTTPRequestDispatchAuthorization
+    ) async throws -> GuardedOperationResult<MobileSubmitResponse> {
+        try await runGuardedAsyncOperation(
+            authorization: dispatchAuthorization,
+            operation: { try await self.submit(body) }
+        )
+    }
 }

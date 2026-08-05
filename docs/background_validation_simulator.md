@@ -38,8 +38,11 @@ O harness:
 - registra callbacks e o `applicationState` correspondente;
 - registra transições de `scenePhase`;
 - registra resultado de `BGTaskScheduler.register` e `submit`;
-- registra token e callback remoto de APNs;
-- grava `Documents/background-validation.json` atomicamente.
+- registra somente presença/tamanho do token e callback remoto de APNs;
+- grava `Documents/background-validation.json` atomicamente, no schema 2, com nomes de evento, chaves e
+  valores fechados.
+  Identifier/token de região, local, coordenadas e erros brutos são removidos inclusive de reports antigos
+  ao relançar o app.
 
 O argumento `--disable-background-validation` desativa a instrumentação. O script sempre o executa na
 limpeza, inclusive quando uma asserção falha.
@@ -75,7 +78,7 @@ Opcionalmente, o UDID de outro simulador pode ser passado como primeiro argument
 | Autorização de localização | Aprovado | `authorization=always`, `accuracy=full`. |
 | Entrada em background | Aprovado | `scene_phase_background`. |
 | Localização contínua em background | Aprovado | Vários `location_update` com `applicationState=background`. |
-| Registro da região | Aprovado | `geofence_monitoring_started`. |
+| Registro da região sintética do harness | Aprovado | `geofence_monitoring_started`; não é confirmação técnica do conjunto candidato por geração. |
 | Geofence ENTER | Aprovado | `geofence_enter` em background. |
 | Geofence EXIT | Aprovado | `geofence_exit` em background. |
 | Mudanças significativas | Parcial | Serviço iniciado; a origem de cada update não pode ser isolada da atualização contínua no simulador. |
@@ -95,8 +98,10 @@ de aparelho físico.
 ## Conclusão
 
 O Simulator comprovou que a configuração `UIBackgroundModes=location`, a autorização “Sempre”, a sessão
-contínua e o monitoramento de região conseguem entregar callbacks enquanto o Checking está em background.
-Isso valida o wiring básico de Core Location.
+contínua e a região **sintética do harness** conseguem entregar callbacks enquanto o Checking está em
+background. Isso valida o wiring básico de Core Location, não a confirmação por geração do monitor candidato.
+Os perfis distribuíveis continuam em `legacyWithDiagnostics`; a prova de `requested → confirmed` do candidato
+permanece coberta pelo adapter testável e exige ensaio físico controlado antes de qualquer rollout.
 
 A Fase 2 ainda **não pode ser marcada como concluída**, porque faltam:
 

@@ -18,22 +18,44 @@ struct AuthApiLive: AuthApi {
         try decode(await http.data(for: HTTPRequest(method: .get, path: "auth/status", query: ["chave": chave])))
     }
     func registerPassword(_ body: WebPasswordRegisterRequest) async throws -> WebPasswordActionResponse {
-        try decode(await http.data(for: HTTPRequest(method: .post, path: "auth/register-password", body: try JSONCoding.encoder.encode(body))))
+        try decode(await http.data(for: HTTPRequest(
+            method: .post,
+            path: "auth/register-password",
+            body: try JSONCoding.encoder.encode(body),
+            sessionCookieResponsePolicy: .authoritativeSessionMutation)))
     }
     func registerUser(_ body: WebUserSelfRegistrationRequest) async throws -> WebUserSelfRegistrationResponse {
-        try decode(await http.data(for: HTTPRequest(method: .post, path: "auth/register-user", body: try JSONCoding.encoder.encode(body))))
+        try decode(await http.data(for: HTTPRequest(
+            method: .post,
+            path: "auth/register-user",
+            body: try JSONCoding.encoder.encode(body),
+            sessionCookieResponsePolicy: .authoritativeSessionMutation)))
     }
     func login(_ body: WebPasswordLoginRequest) async throws -> WebPasswordActionResponse {
-        try decode(await http.data(for: HTTPRequest(method: .post, path: "auth/login", body: try JSONCoding.encoder.encode(body))))
+        try decode(await http.data(for: HTTPRequest(
+            method: .post,
+            path: "auth/login",
+            body: try JSONCoding.encoder.encode(body),
+            sessionCookieResponsePolicy: .authoritativeSessionMutation)))
     }
     func logout() async throws -> WebPasswordActionResponse {
-        try decode(await http.data(for: HTTPRequest(method: .post, path: "auth/logout")))
+        try decode(await http.data(for: HTTPRequest(
+            method: .post,
+            path: "auth/logout",
+            sessionCookieResponsePolicy: .authoritativeSessionMutation)))
     }
     func changePassword(_ body: WebPasswordChangeRequest) async throws -> WebPasswordActionResponse {
-        try decode(await http.data(for: HTTPRequest(method: .post, path: "auth/change-password", body: try JSONCoding.encoder.encode(body))))
+        try decode(await http.data(for: HTTPRequest(
+            method: .post,
+            path: "auth/change-password",
+            body: try JSONCoding.encoder.encode(body),
+            sessionCookieResponsePolicy: .authoritativeSessionMutation)))
     }
     func deleteAccount() async throws -> WebPasswordActionResponse {
-        try decode(await http.data(for: HTTPRequest(method: .post, path: "auth/delete-account")))
+        try decode(await http.data(for: HTTPRequest(
+            method: .post,
+            path: "auth/delete-account",
+            sessionCookieResponsePolicy: .authoritativeSessionMutation)))
     }
 
     private func decode<T: Decodable>(_ data: Data) throws -> T { try JSONCoding.decoder.decode(T.self, from: data) }

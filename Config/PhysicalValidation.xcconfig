@@ -1,0 +1,17 @@
+#include "Shared.xcconfig"
+
+// Configuração local, não-shipping, para inspecionar somente o snapshot sanitizado de geofences.
+// Não registre este bundle no Apple Developer Portal nem a assine/instale/envie sem uma aprovação posterior
+// e um App ID/profile isolados. O bloqueio é operacional; não se fixa CODE_SIGNING_ALLOWED aqui para não
+// impedir esse futuro ensaio autorizado.
+CHECKING_BUNDLE_ID = br.com.tscode.checking.physicalvalidation
+CHECKING_APP_NAME = Checking Physical Validation
+// Mantém o entitlement-alvo de produção para que um futuro artefato autorizado seja Release-equivalente,
+// exceto pela identidade isolada do bundle.
+CHECKING_APNS_ENV = production
+CHECKING_BACKGROUND_RELIABILITY_PROFILE = candidate
+
+// O perfil `candidate` mantém o experimento de movimento desligado por construção.
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) PHYSICAL_VALIDATION
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) PHYSICAL_VALIDATION=1
+SWIFT_OPTIMIZATION_LEVEL = -O

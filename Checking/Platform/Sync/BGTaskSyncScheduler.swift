@@ -17,14 +17,22 @@ final class BGTaskSyncScheduler: SyncScheduler, @unchecked Sendable {
     }
 
     func scheduleSync() {
-        // BGTask para o caso de background (best-effort).
-        let request = BGProcessingTaskRequest(identifier: Self.taskIdentifier)
-        request.requiresNetworkConnectivity = true
-        request.requiresExternalPower = false
-        try? BGTaskScheduler.shared.submit(request)   // falha se não registrado/permitido — best-effort
+        rescheduleBackgroundProcessing()
         // Drain imediato se online (paridade com o WorkManager NetworkType.CONNECTED, que roda já ao conectar).
         // O `triggerDrain` é single-flight e auto-aborta (RETRY) se ainda offline.
         let trigger = lock.withLock { drainTrigger }
         trigger?()
+    }
+
+    /// Reenvia somente o request oportunista de `BGProcessing`, sem disparar um segundo drain local.
+    ///
+    /// O controller de execução usa esta variante após `.retry` ou cancelamento do último orçamento: a
+    /// fila já é o handoff durável, e iniciar o gatilho imediato ao terminar um handler poderia criar um
+    /// ciclo de wake vazio. `scheduleSync()` conserva a semântica existente de enqueue/reconexão.
+    func rescheduleBackgroundProcessing() {
+        let request = BGProcessingTaskRequest(identifier: Self.taskIdentifier)
+        request.requiresNetworkConnectivity = true
+        request.requiresExternalPower = false
+        try? BGTaskScheduler.shared.submit(request)   // falha se não registrado/permitido — best-effort
     }
 }

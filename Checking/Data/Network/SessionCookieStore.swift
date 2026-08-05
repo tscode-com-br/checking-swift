@@ -15,14 +15,53 @@ struct CookieRecord: Codable, Equatable, Sendable {
 
 /// Jar de cookies de sessão — port de PersistentCookieJar.kt.
 /// Um blob por `host`, overwrite na resposta, filtra `expiresAt > now` na leitura, `clear()` no logout.
+struct SessionCookieRequestSnapshot: Sendable {
+    /// Somente em memória: correlaciona a resposta à identidade vigente quando a requisição foi montada.
+    /// Não é persistido nem identifica usuário/instalação.
+    let generation: UInt64
+    let cookieHeader: String?
+}
+
 protocol SessionCookieStore: Sendable {
-    /// Header `Cookie` para a requisição (nil se não houver cookie ativo p/ o host).
-    func cookieHeader(for url: URL) -> String?
-    /// Interpreta `Set-Cookie` da resposta e sobrescreve o blob do host.
-    func saveFromResponse(_ url: URL, headerFields: [String: String])
-    /// Invalida tudo (logout / troca de conta / exclusão).
+    /// Captura atomicamente o header e a geração para a requisição que está sendo montada.
+    func requestSnapshot(for url: URL) -> SessionCookieRequestSnapshot
+    /// Interpreta `Set-Cookie` e sobrescreve o host somente se a identidade ainda for a mesma.
+    func saveFromResponse(
+        _ url: URL,
+        headerFields: [String: String],
+        requestGeneration: UInt64
+    )
+    /// Adota (quando presente) o cookie de uma mutação de sessão e avança a geração na mesma seção
+    /// crítica. Assim a resposta auth vence respostas comuns anteriores independentemente da ordem em
+    /// que os callbacks de rede chegam, mas continua rejeitada após troca/logout de identidade.
+    func saveAuthoritativeSessionResponse(
+        _ url: URL,
+        headerFields: [String: String],
+        requestGeneration: UInt64
+    )
+    /// Invalida respostas já em voo sem remover o cookie que uma operação serial ainda precisa enviar.
+    func invalidateInFlightResponses()
+    /// Invalida tudo e avança a geração (logout / troca de conta / exclusão).
     func clear()
 }
+
+extension SessionCookieStore {
+    /// Conveniência para consumidores que apenas leem a sessão atual.
+    func cookieHeader(for url: URL) -> String? {
+        requestSnapshot(for: url).cookieHeader
+    }
+}
+
+/// Seam estreito do blob persistente. Produção continua usando `KeychainStore`; a injeção existe
+/// para provar deterministicamente a coordenação atômica mesmo quando o Keychain do Simulator não está
+/// disponível para um test runner sem assinatura.
+protocol SessionCookiePersistence: Sendable {
+    func data(for account: String) -> Data?
+    @discardableResult func set(_ data: Data, for account: String) -> Bool
+    func removeAll()
+}
+
+extension KeychainStore: SessionCookiePersistence {}
 
 /// Lógica pura de cookie (testável sem URLSession).
 enum SessionCookies {
@@ -61,27 +100,60 @@ enum SessionCookies {
 final class InMemorySessionCookieStore: SessionCookieStore, @unchecked Sendable {
     private let lock = NSLock()
     private var byHost: [String: [CookieRecord]] = [:]
+    private var generation: UInt64 = 0
     private let now: @Sendable () -> Int64
 
     init(now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }) {
         self.now = now
     }
 
-    func cookieHeader(for url: URL) -> String? {
-        guard let host = url.host else { return nil }
-        lock.lock(); let records = byHost[host] ?? []; lock.unlock()
-        return SessionCookies.header(records, nowMillis: now())
+    func requestSnapshot(for url: URL) -> SessionCookieRequestSnapshot {
+        let nowMillis = now()
+        return lock.withLock {
+            let records = url.host.flatMap { byHost[$0] } ?? []
+            return SessionCookieRequestSnapshot(
+                generation: generation,
+                cookieHeader: SessionCookies.header(records, nowMillis: nowMillis))
+        }
     }
 
-    func saveFromResponse(_ url: URL, headerFields: [String: String]) {
+    func saveFromResponse(
+        _ url: URL,
+        headerFields: [String: String],
+        requestGeneration: UInt64
+    ) {
         guard let host = url.host else { return }
         let records = SessionCookies.parse(headerFields: headerFields, for: url)
         guard !records.isEmpty else { return }          // vazio → no-op (não limpa o existente)
-        lock.lock(); byHost[host] = records; lock.unlock() // OVERWRITE do blob do host
+        lock.withLock {
+            guard generation == requestGeneration else { return }
+            byHost[host] = records                       // OVERWRITE do blob do host
+        }
+    }
+
+    func saveAuthoritativeSessionResponse(
+        _ url: URL,
+        headerFields: [String: String],
+        requestGeneration: UInt64
+    ) {
+        guard let host = url.host else { return }
+        let records = SessionCookies.parse(headerFields: headerFields, for: url)
+        lock.withLock {
+            guard generation == requestGeneration else { return }
+            if !records.isEmpty { byHost[host] = records }
+            generation &+= 1
+        }
+    }
+
+    func invalidateInFlightResponses() {
+        lock.withLock { generation &+= 1 }
     }
 
     func clear() {
-        lock.lock(); byHost.removeAll(); lock.unlock()
+        lock.withLock {
+            generation &+= 1
+            byHost.removeAll()
+        }
     }
 }
 
@@ -89,7 +161,9 @@ final class InMemorySessionCookieStore: SessionCookieStore, @unchecked Sendable 
 /// Cada host ocupa uma conta separada para preservar o overwrite por host do Android.
 final class KeychainSessionCookieStore: SessionCookieStore, @unchecked Sendable {
     static let defaultService = "br.com.tscode.checking.session-cookies"
-    private let keychain: KeychainStore
+    private let keychain: any SessionCookiePersistence
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
     private let now: @Sendable () -> Int64
 
     init(service: String = defaultService,
@@ -98,19 +172,70 @@ final class KeychainSessionCookieStore: SessionCookieStore, @unchecked Sendable 
         self.now = now
     }
 
-    func cookieHeader(for url: URL) -> String? {
-        guard let host = url.host,
-              let data = keychain.data(for: host),
-              let records = try? JSONDecoder().decode([CookieRecord].self, from: data) else { return nil }
-        return SessionCookies.header(records, nowMillis: now())
+    init(
+        persistence: any SessionCookiePersistence,
+        now: @escaping @Sendable () -> Int64 = {
+            Int64(Date().timeIntervalSince1970 * 1000)
+        }
+    ) {
+        keychain = persistence
+        self.now = now
     }
 
-    func saveFromResponse(_ url: URL, headerFields: [String: String]) {
+    func requestSnapshot(for url: URL) -> SessionCookieRequestSnapshot {
+        let nowMillis = now()
+        return lock.withLock {
+            let records: [CookieRecord]
+            if let host = url.host,
+               let data = keychain.data(for: host),
+               let decoded = try? JSONDecoder().decode([CookieRecord].self, from: data) {
+                records = decoded
+            } else {
+                records = []
+            }
+            return SessionCookieRequestSnapshot(
+                generation: generation,
+                cookieHeader: SessionCookies.header(records, nowMillis: nowMillis))
+        }
+    }
+
+    func saveFromResponse(
+        _ url: URL,
+        headerFields: [String: String],
+        requestGeneration: UInt64
+    ) {
         guard let host = url.host else { return }
         let records = SessionCookies.parse(headerFields: headerFields, for: url)
         guard !records.isEmpty, let data = try? JSONEncoder().encode(records) else { return }
-        _ = keychain.set(data, for: host)
+        lock.withLock {
+            guard generation == requestGeneration else { return }
+            _ = keychain.set(data, for: host)
+        }
     }
 
-    func clear() { keychain.removeAll() }
+    func saveAuthoritativeSessionResponse(
+        _ url: URL,
+        headerFields: [String: String],
+        requestGeneration: UInt64
+    ) {
+        guard let host = url.host else { return }
+        let records = SessionCookies.parse(headerFields: headerFields, for: url)
+        let data = records.isEmpty ? nil : try? JSONEncoder().encode(records)
+        lock.withLock {
+            guard generation == requestGeneration else { return }
+            if let data { _ = keychain.set(data, for: host) }
+            generation &+= 1
+        }
+    }
+
+    func invalidateInFlightResponses() {
+        lock.withLock { generation &+= 1 }
+    }
+
+    func clear() {
+        lock.withLock {
+            generation &+= 1
+            keychain.removeAll()
+        }
+    }
 }

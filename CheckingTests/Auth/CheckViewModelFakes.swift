@@ -20,6 +20,14 @@ func status(found: Bool = false, hasPassword: Bool = false, authenticated: Bool 
 }
 
 final class FakeAuthRepository: AuthRepository, @unchecked Sendable {
+    private struct SimulatedCookieRequest: Sendable {
+        let store: InMemorySessionCookieStore
+        let snapshot: SessionCookieRequestSnapshot
+        let value: String
+    }
+
+    private static let simulatedCookieURL =
+        URL(string: "https://example.invalid/api/web/auth/login")!
     var statusResults: [String: AppResult<AuthStatus>] = [:]
     var statusGates: [String: AsyncGate] = [:]     // se setado p/ a chave, getStatus trava até release()
     var loginResults: [String: AppResult<AuthStatus>] = [:]
@@ -28,28 +36,157 @@ final class FakeAuthRepository: AuthRepository, @unchecked Sendable {
     var changePasswordResult: AppResult<AuthStatus> = .failure(.unknown(description: nil))
     var logoutResult: AppResult<Void> = .success(())
     var deleteResult: AppResult<Void> = .success(())
+    var deleteGate: AsyncGate?
+    var selfRegisterGate: AsyncGate?
+    var registerPasswordGate: AsyncGate?
+    var changePasswordGate: AsyncGate?
+    var loginGates: [String: AsyncGate] = [:]
+    var historyGate: AsyncGate?
     var historyResult: AppResult<HistoryState> = .failure(.unknown(description: nil))
 
     private let lock = NSLock()
+    private var recordedStatusKeys: [String] = []
     private var recordedLogins: [(chave: String, password: String)] = []
+    private var recordedSelfRegistrationKeys: [String] = []
+    private var recordedLogoutCount = 0
+    private var pendingLogoutGate: AsyncGate?
     private var getHistoryCount = 0
+    private var deleteCount = 0
+    private var authenticationResponseCookie: String?
+    private var persistedSessionCookie: String?
+    private var sessionCookieStore: InMemorySessionCookieStore?
+    var statusCalls: [String] { lock.withLock { recordedStatusKeys } }
     var loginCalls: [(chave: String, password: String)] { lock.withLock { recordedLogins } }
+    var selfRegistrationCalls: [String] {
+        lock.withLock { recordedSelfRegistrationKeys }
+    }
+    var logoutCallCount: Int { lock.withLock { recordedLogoutCount } }
     var getHistoryCallCount: Int { lock.withLock { getHistoryCount } }
+    var deleteCallCount: Int { lock.withLock { deleteCount } }
+    var simulatedAuthenticationResponseCookie: String? {
+        get { lock.withLock { authenticationResponseCookie } }
+        set { lock.withLock { authenticationResponseCookie = newValue } }
+    }
+    var simulatedPersistedSessionCookie: String? {
+        let values = lock.withLock { (sessionCookieStore, persistedSessionCookie) }
+        return values.0?.cookieHeader(for: Self.simulatedCookieURL) ?? values.1
+    }
+    var nextLogoutGate: AsyncGate? {
+        get { lock.withLock { pendingLogoutGate } }
+        set { lock.withLock { pendingLogoutGate = newValue } }
+    }
+
+    func attachSessionCookieStore(_ store: InMemorySessionCookieStore) {
+        lock.withLock { sessionCookieStore = store }
+    }
 
     func getStatus(_ chave: String) async -> AppResult<AuthStatus> {
+        lock.withLock { recordedStatusKeys.append(chave) }
+        let result = statusResults[chave] ?? .failure(.unknown(description: nil))
         if let gate = statusGates[chave] { await gate.wait() }
-        return statusResults[chave] ?? .failure(.unknown(description: nil))
+        return result
     }
     func login(_ chave: String, _ password: String) async -> AppResult<AuthStatus> {
         lock.withLock { recordedLogins.append((chave, password)) }
-        return loginResults[chave] ?? .failure(.unknown(description: nil))
+        let result = loginResults[chave] ?? .failure(.unknown(description: nil))
+        let cookieRequest = beginSimulatedAuthenticationRequest()
+        await loginGates[chave]?.wait()
+        finishSimulatedAuthenticationRequest(cookieRequest)
+        return result
     }
-    func logout() async -> AppResult<Void> { logoutResult }
-    func deleteAccount() async -> AppResult<Void> { deleteResult }
-    func registerPassword(_ chave: String, _ project: String?, _ password: String) async -> AppResult<AuthStatus> { registerPasswordResult }
-    func changePassword(_ chave: String, _ oldPassword: String, _ newPassword: String) async -> AppResult<AuthStatus> { changePasswordResult }
-    func selfRegister(_ chave: String, _ nome: String, _ projetos: [String], _ email: String?, _ password: String, _ confirmPassword: String) async -> AppResult<AuthStatus> { selfRegisterResult }
-    func getHistory(_ chave: String) async -> AppResult<HistoryState> { lock.withLock { getHistoryCount += 1 }; return historyResult }
+    func logout() async -> AppResult<Void> {
+        let gate = lock.withLock { () -> AsyncGate? in
+            recordedLogoutCount += 1
+            defer { pendingLogoutGate = nil }
+            return pendingLogoutGate
+        }
+        await gate?.wait()
+        let store = lock.withLock { () -> InMemorySessionCookieStore? in
+            persistedSessionCookie = nil
+            return sessionCookieStore
+        }
+        store?.clear()
+        return logoutResult
+    }
+    func deleteAccount() async -> AppResult<Void> {
+        lock.withLock { deleteCount += 1 }
+        await deleteGate?.wait()
+        if case .success = deleteResult {
+            let store = lock.withLock { () -> InMemorySessionCookieStore? in
+                persistedSessionCookie = nil
+                return sessionCookieStore
+            }
+            store?.clear()
+        }
+        return deleteResult
+    }
+    func registerPassword(
+        _ chave: String,
+        _ project: String?,
+        _ password: String
+    ) async -> AppResult<AuthStatus> {
+        let result = registerPasswordResult
+        let cookieRequest = beginSimulatedAuthenticationRequest()
+        await registerPasswordGate?.wait()
+        finishSimulatedAuthenticationRequest(cookieRequest)
+        return result
+    }
+    func changePassword(
+        _ chave: String,
+        _ oldPassword: String,
+        _ newPassword: String
+    ) async -> AppResult<AuthStatus> {
+        let result = changePasswordResult
+        let cookieRequest = beginSimulatedAuthenticationRequest()
+        await changePasswordGate?.wait()
+        finishSimulatedAuthenticationRequest(cookieRequest)
+        return result
+    }
+    func selfRegister(_ chave: String, _ nome: String, _ projetos: [String], _ email: String?, _ password: String, _ confirmPassword: String) async -> AppResult<AuthStatus> {
+        lock.withLock { recordedSelfRegistrationKeys.append(chave) }
+        let cookieRequest = beginSimulatedAuthenticationRequest()
+        await selfRegisterGate?.wait()
+        finishSimulatedAuthenticationRequest(cookieRequest)
+        return selfRegisterResult
+    }
+    func getHistory(_ chave: String) async -> AppResult<HistoryState> {
+        lock.withLock { getHistoryCount += 1 }
+        let result = historyResult
+        await historyGate?.wait()
+        return result
+    }
+
+    private func beginSimulatedAuthenticationRequest() -> SimulatedCookieRequest? {
+        lock.withLock {
+            guard let value = authenticationResponseCookie,
+                  let store = sessionCookieStore else { return nil }
+            return SimulatedCookieRequest(
+                store: store,
+                snapshot: store.requestSnapshot(for: Self.simulatedCookieURL),
+                value: value
+            )
+        }
+    }
+
+    private func finishSimulatedAuthenticationRequest(
+        _ request: SimulatedCookieRequest?
+    ) {
+        guard let request else {
+            lock.withLock {
+                if let authenticationResponseCookie {
+                    persistedSessionCookie = authenticationResponseCookie
+                }
+            }
+            return
+        }
+        request.store.saveFromResponse(
+            Self.simulatedCookieURL,
+            headerFields: [
+                "Set-Cookie": "session=\(request.value); Path=/; Secure; HttpOnly",
+            ],
+            requestGeneration: request.snapshot.generation
+        )
+    }
 }
 
 final class FakeProjectRepository: ProjectRepository, @unchecked Sendable {
@@ -58,15 +195,26 @@ final class FakeProjectRepository: ProjectRepository, @unchecked Sendable {
     var updateUserProjectsResult: AppResult<UserProjects>?
     var updateUserProjectsResults: [AppResult<UserProjects>] = []
     var firstUpdateUserProjectsGate: AsyncGate?
+    var getUserProjectsGate: AsyncGate?
+    var listProjectsGate: AsyncGate?
     private let lock = NSLock()
+    private var recordedListProjectsCalls = 0
     private var recordedGetUserProjectsCalls = 0
     private var recordedUpdateUserProjectsCalls: [[String]] = []
+    var listProjectsCallCount: Int { lock.withLock { recordedListProjectsCalls } }
     var getUserProjectsCallCount: Int { lock.withLock { recordedGetUserProjectsCalls } }
     var updateUserProjectsCalls: [[String]] { lock.withLock { recordedUpdateUserProjectsCalls } }
-    func listProjects() async -> AppResult<[Project]> { result }
+    func listProjects() async -> AppResult<[Project]> {
+        lock.withLock { recordedListProjectsCalls += 1 }
+        let captured = result
+        await listProjectsGate?.wait()
+        return captured
+    }
     func getUserProjects() async -> AppResult<UserProjects> {
         lock.withLock { recordedGetUserProjectsCalls += 1 }
-        return userProjectsResult
+        let captured = userProjectsResult
+        await getUserProjectsGate?.wait()
+        return captured
     }
     func updateUserProjects(_ projectNames: [String]) async -> AppResult<UserProjects> {
         let callIndex = lock.withLock { () -> Int in
@@ -88,12 +236,18 @@ final class SpyOrchestrator: OrchestratorRunning, @unchecked Sendable {
     private let lock = NSLock()
     private var calls: [OrchestratorTrigger] = []
     private var accuracyRetryInvalidations = 0
+    private var contextTransitionBegins = 0
+    private var contextTransitionQuiescences = 0
+    private var contextTransitionEnds = 0
     private var scheduledPauseChanges = 0
     private var accepted: [(String, String, CheckAction, HistoryState)] = []
     private var confirmed: [(String, HistoryState)] = []
     private var pendingRunGate: AsyncGate?
     var runOnceCalls: [OrchestratorTrigger] { lock.withLock { calls } }
     var invalidateAccuracyRetryCount: Int { lock.withLock { accuracyRetryInvalidations } }
+    var beginAutomationContextTransitionCount: Int { lock.withLock { contextTransitionBegins } }
+    var awaitAutomationQuiescenceCount: Int { lock.withLock { contextTransitionQuiescences } }
+    var endAutomationContextTransitionCount: Int { lock.withLock { contextTransitionEnds } }
     var scheduledPauseSettingsChangeCount: Int { lock.withLock { scheduledPauseChanges } }
     var acceptedChecks: [(String, String, CheckAction, HistoryState)] { lock.withLock { accepted } }
     var confirmedStates: [(String, HistoryState)] { lock.withLock { confirmed } }
@@ -101,16 +255,33 @@ final class SpyOrchestrator: OrchestratorRunning, @unchecked Sendable {
         get { lock.withLock { pendingRunGate } }
         set { lock.withLock { pendingRunGate = newValue } }
     }
-    func runOnce(_ trigger: OrchestratorTrigger) async {
+    @discardableResult
+    func runOnce(_ trigger: OrchestratorTrigger) async -> EvaluationCompletion {
         let gate = lock.withLock { () -> AsyncGate? in
             calls.append(trigger)
             defer { pendingRunGate = nil }
             return pendingRunGate
         }
         await gate?.wait()
+        return EvaluationCompletion(
+            evaluationID: EvaluationID(),
+            outcome: .noAction,
+            completedBeforeExpiration: true)
     }
     func invalidateAccuracyRetry() async {
         lock.withLock { accuracyRetryInvalidations += 1 }
+    }
+    func beginAutomationContextTransition() async -> AutomationContextTransitionToken {
+        lock.withLock {
+            contextTransitionBegins += 1
+        }
+        return AutomationContextTransitionToken()
+    }
+    func awaitAutomationQuiescence(_ token: AutomationContextTransitionToken) async {
+        lock.withLock { contextTransitionQuiescences += 1 }
+    }
+    func endAutomationContextTransition(_ token: AutomationContextTransitionToken) async {
+        lock.withLock { contextTransitionEnds += 1 }
     }
     func scheduledPauseSettingsDidChange() async {
         lock.withLock { scheduledPauseChanges += 1 }
@@ -152,6 +323,39 @@ struct NoopCheckEventStream: CheckEventStreaming {
     func events(chave: String) -> AsyncStream<String> { AsyncStream { $0.finish() } }
 }
 
+final class SpyCheckEventStream: CheckEventStreaming, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedKeys: [String] = []
+
+    var calls: [String] { lock.withLock { recordedKeys } }
+
+    func events(chave: String) -> AsyncStream<String> {
+        lock.withLock { recordedKeys.append(chave) }
+        return AsyncStream { $0.finish() }
+    }
+}
+
+actor ControlledPermissionsInspector: PermissionsInspecting {
+    private var status: PermissionsStatus
+    private let gate: AsyncGate?
+    private(set) var callCount = 0
+
+    init(status: PermissionsStatus, gate: AsyncGate? = nil) {
+        self.status = status
+        self.gate = gate
+    }
+
+    func inspect() async -> PermissionsStatus {
+        callCount += 1
+        await gate?.wait()
+        return status
+    }
+
+    func update(_ status: PermissionsStatus) {
+        self.status = status
+    }
+}
+
 actor SpySignificantLocationMonitor: SignificantLocationMonitoring {
     private(set) var startCount = 0
     private(set) var stopCount = 0
@@ -174,6 +378,25 @@ actor SpyGeofenceRegionManager: GeofenceRegionManaging {
     }
 }
 
+actor SpyEvaluationJournal: EvaluationJournaling {
+    private(set) var clearCount = 0
+    private(set) var finishedOutcomes: [EvaluationTerminalOutcome] = []
+    private(set) var eventTrace: [String] = []
+
+    func begin(_ start: EvaluationStart) async {}
+    func coalesce(_ event: EvaluationCoalescence) async {}
+    func finish(id: EvaluationID, terminal: EvaluationTerminal) async {
+        finishedOutcomes.append(terminal.outcome)
+        eventTrace.append("finish:\(terminal.outcome.rawValue)")
+    }
+    func reconcileOrphans() async {}
+    func recent(limit: Int) async -> [EvaluationRecord] { [] }
+    func clear() async {
+        clearCount += 1
+        eventTrace.append("clear")
+    }
+}
+
 /// Harness dos testes do ViewModel — configure os fakes/prefs, depois `build()`.
 @MainActor
 final class VMHarness {
@@ -184,7 +407,9 @@ final class VMHarness {
     let orchestrator = SpyOrchestrator()
     let significantLocationMonitor = SpySignificantLocationMonitor()
     let geofenceRegionManager = SpyGeofenceRegionManager()
+    let evaluationJournal = SpyEvaluationJournal()
     let passwords = SpySecurePasswordStore()
+    let sessionCookies = InMemorySessionCookieStore()
     let checkRepository = FakeCheckRepository()
     let captureLocation = FakeCaptureLocation(.noPermission)
     let offlineQueue = FakeOfflineQueue()
@@ -193,17 +418,54 @@ final class VMHarness {
         locationAuthorization: .always, preciseAccuracy: true, cameraMicGranted: true,
         notificationAuthorization: .authorized, lowPowerMode: false, backgroundRefresh: .available)
 
-    func build() -> CheckViewModel {
-        CheckViewModel(appPreferences: prefs, securePasswordStore: passwords, authRepository: auth,
+    func build(
+        backgroundReliabilityProfile: BackgroundReliabilityProfile = .legacyWithDiagnostics,
+        appPreferences: (any AppPreferencesStore)? = nil,
+        securePasswordStore: (any SecurePasswordStore)? = nil,
+        authRepository: (any AuthRepository)? = nil,
+        authSessionCoordinator: (any AuthSessionCoordinating)? = nil,
+        orchestrator: (any OrchestratorRunning)? = nil,
+        evaluationJournal: (any EvaluationJournaling)? = nil,
+        permissionsInspector: (any PermissionsInspecting)? = nil,
+        checkEventStream: (any CheckEventStreaming)? = nil,
+        approvalPollingSleeper: any Sleeping = TaskSleeper(),
+        initialState: CheckUiState? = nil
+    ) -> CheckViewModel {
+        let resolvedPasswords = securePasswordStore ?? passwords
+        let resolvedAuthRepository = authRepository ?? auth
+        if authRepository == nil {
+            auth.attachSessionCookieStore(sessionCookies)
+        }
+        let resolvedSessionCoordinator = authSessionCoordinator
+            ?? AuthSessionCoordinator(
+                authRepository: resolvedAuthRepository,
+                securePasswordStore: resolvedPasswords,
+                cookieStore: sessionCookies)
+        return CheckViewModel(
+                       appPreferences: appPreferences ?? prefs,
+                       securePasswordStore: resolvedPasswords,
+                       authRepository: resolvedAuthRepository,
+                       authSessionCoordinator: resolvedSessionCoordinator,
                        projectRepository: projects, checkRepository: checkRepository,
                        captureLocationUseCase: captureLocation, offlineQueue: offlineQueue,
-                       permissionsInspector: StaticPermissionsInspector(status: permissions), orchestrator: orchestrator,
+                       permissionsInspector: permissionsInspector
+                           ?? StaticPermissionsInspector(status: permissions),
+                       orchestrator: orchestrator ?? self.orchestrator,
                        significantLocationMonitor: significantLocationMonitor,
-                       checkEventStream: NoopCheckEventStream(), activityLogger: NoopActivityLogger(),
-                       clock: FixedClock(Date(timeIntervalSince1970: 0)), activityLog: activityLog,
-                       geofenceRegionManager: geofenceRegionManager)
+                       checkEventStream: checkEventStream ?? NoopCheckEventStream(),
+                       activityLogger: NoopActivityLogger(),
+                       clock: FixedClock(Date(timeIntervalSince1970: 0)),
+                       evaluationJournal: evaluationJournal ?? self.evaluationJournal,
+                       activityLog: activityLog,
+                       geofenceRegionManager: geofenceRegionManager,
+                       backgroundReliabilityProfile: backgroundReliabilityProfile,
+                       approvalPollingSleeper: approvalPollingSleeper,
+                       initialState: initialState)
     }
-    func teardown() { UserDefaults.standard.removePersistentDomain(forName: suiteName) }
+    func teardown() {
+        sessionCookies.clear()
+        UserDefaults.standard.removePersistentDomain(forName: suiteName)
+    }
 }
 
 struct StaticPermissionsInspector: PermissionsInspecting {

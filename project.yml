@@ -14,6 +14,9 @@ options:
 
 configs:
   Debug: debug
+  # Configuração local para inspeção física do snapshot de geofences. Não é uma configuração de
+  # distribuição: usa bundle isolado e exige App ID/profile distintos, se vier a ser assinada no futuro.
+  PhysicalValidation: release
   Staging: release
   Release: release
 
@@ -33,6 +36,7 @@ targets:
     platform: iOS
     configFiles:
       Debug: Config/Debug.xcconfig
+      PhysicalValidation: Config/PhysicalValidation.xcconfig
       Staging: Config/Staging.xcconfig
       Release: Config/Release.xcconfig
     sources:
@@ -85,6 +89,9 @@ schemes:
   Checking (Staging):
     build: { targets: { Checking: all } }
     run: { config: Staging }
+  Checking (PhysicalValidation):
+    build: { targets: { Checking: all } }
+    run: { config: PhysicalValidation }
   Checking (Release):
     build: { targets: { Checking: all } }
     run: { config: Release }

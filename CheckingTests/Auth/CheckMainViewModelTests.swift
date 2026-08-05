@@ -117,6 +117,7 @@ final class CheckMainViewModelTests: XCTestCase {
 
     func test_removingLastProjectPersistsEmptyMemberships() async {
         let (h, vm) = await authenticatedHarness()
+        let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
         h.projects.updateUserProjectsResult = .success(UserProjects(projects: [], activeProject: ""))
         vm.onProjectMembershipToggled("P80")
         await settle { !vm.uiState.isProjectMembershipSyncing }
@@ -132,12 +133,17 @@ final class CheckMainViewModelTests: XCTestCase {
             vm.uiState.notificationPrimary,
             t("projects.noActiveProject", lang: "pt"))
         XCTAssertEqual(vm.uiState.notificationTone, .error)
-        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 1)
+        XCTAssertEqual(
+            h.orchestrator.beginAutomationContextTransitionCount,
+            transitionsBefore + 1
+        )
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 0)
         h.teardown()
     }
 
     func test_addingMembershipUpdatesServerStateAndClearsManualLocation() async {
         let (h, vm) = await authenticatedHarness()
+        let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
         vm.onManualLocationSelected("Escritório Principal")
         h.projects.updateUserProjectsResult = .success(UserProjects(projects: ["P80", "P81"], activeProject: "P80"))
         vm.onProjectMembershipToggled("P81")
@@ -146,6 +152,10 @@ final class CheckMainViewModelTests: XCTestCase {
         XCTAssertEqual(h.projects.updateUserProjectsCalls, [["P80", "P81"]])
         XCTAssertNil(vm.uiState.selectedManualLocation)
         XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 0)
+        XCTAssertEqual(
+            h.orchestrator.beginAutomationContextTransitionCount,
+            transitionsBefore
+        )
         h.teardown()
     }
 
@@ -451,6 +461,32 @@ final class CheckMainViewModelTests: XCTestCase {
         h.teardown()
     }
 
+    func test_localWipeDrainsCancelledManualSubmitBeforeClearingOfflineQueue() async {
+        let submitGate = AsyncGate()
+        let (h, vm) = await authenticatedHarness(submitResult: .failure(.network))
+        h.checkRepository.submitGate = submitGate
+        vm.onManualLocationSelected("Unidade P80")
+        let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
+
+        vm.onSubmit()
+        await settle { h.checkRepository.submitCount == 1 }
+
+        let deletion = Task { await vm.deleteLocalData() }
+        await settle {
+            h.orchestrator.beginAutomationContextTransitionCount
+                == transitionsBefore + 1
+        }
+        XCTAssertTrue(h.offlineQueue.enqueued.isEmpty)
+
+        await submitGate.release()
+        await deletion.value
+
+        XCTAssertTrue(h.offlineQueue.enqueued.isEmpty)
+        XCTAssertEqual(h.offlineQueue.clearCount, 1)
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 0)
+        h.teardown()
+    }
+
     func test_manualRejectedSubmissionsDoNotInvalidateAccuracyRetry() async {
         let failures: [ApiError] = [
             .unauthorized,
@@ -460,6 +496,7 @@ final class CheckMainViewModelTests: XCTestCase {
 
         for failure in failures {
             let (h, vm) = await authenticatedHarness(submitResult: .failure(failure))
+            let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
             vm.onManualLocationSelected("Unidade P80")
 
             vm.onSubmit()
@@ -469,8 +506,15 @@ final class CheckMainViewModelTests: XCTestCase {
             }
 
             if case .unauthorized = failure {
-                await settle { h.orchestrator.invalidateAccuracyRetryCount == 1 }
-                XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 1)
+                await settle {
+                    h.orchestrator.beginAutomationContextTransitionCount
+                        == transitionsBefore + 1
+                }
+                XCTAssertEqual(
+                    h.orchestrator.beginAutomationContextTransitionCount,
+                    transitionsBefore + 1
+                )
+                XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 0)
             } else {
                 XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 0, "\(failure)")
             }
@@ -647,7 +691,7 @@ final class CheckMainViewModelTests: XCTestCase {
     func test_foregroundResumeRefreshesMembershipRemovedByAnotherClient() async {
         let (h, vm) = await authenticatedHarness()
         h.projects.userProjectsResult = .success(UserProjects(projects: [], activeProject: ""))
-        let invalidationsBefore = h.orchestrator.invalidateAccuracyRetryCount
+        let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
 
         vm.onForegroundResume()
         await settle {
@@ -662,7 +706,10 @@ final class CheckMainViewModelTests: XCTestCase {
             from: Data((await h.prefs.userSettingsJson()).utf8))
         XCTAssertEqual(map?["HR70"]?.projects, [])
         XCTAssertEqual(map?["HR70"]?.activeProject, "")
-        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, invalidationsBefore + 1)
+        XCTAssertEqual(
+            h.orchestrator.beginAutomationContextTransitionCount,
+            transitionsBefore + 1
+        )
         h.teardown()
     }
 
@@ -706,12 +753,20 @@ final class CheckMainViewModelTests: XCTestCase {
         vm.recordBackgroundLocationConsent()
         _ = await vm.setAutomaticActivitiesEnabled(true)
         let unregistersBefore = await h.geofenceRegionManager.unregisterCount
+        let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
+        let transitionEndsBefore = h.orchestrator.endAutomationContextTransitionCount
 
         vm.onChaveChanged("AB")
-        try? await Task.sleep(for: .milliseconds(50))
+        await settle {
+            h.orchestrator.endAutomationContextTransitionCount == transitionEndsBefore + 1
+        }
         let unregistersAfter = await h.geofenceRegionManager.unregisterCount
 
         XCTAssertGreaterThan(unregistersAfter, unregistersBefore)
+        XCTAssertEqual(
+            h.orchestrator.beginAutomationContextTransitionCount,
+            transitionsBefore + 1
+        )
         h.teardown()
     }
 
@@ -720,7 +775,8 @@ final class CheckMainViewModelTests: XCTestCase {
         vm.recordBackgroundLocationConsent()
         _ = await vm.setAutomaticActivitiesEnabled(true)
         let unregistersBefore = await h.geofenceRegionManager.unregisterCount
-        let invalidationsBefore = h.orchestrator.invalidateAccuracyRetryCount
+        let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
+        let transitionEndsBefore = h.orchestrator.endAutomationContextTransitionCount
 
         let disabled = await vm.setAutomaticActivitiesEnabled(false)
         let monitorActive = await h.significantLocationMonitor.isActive()
@@ -729,7 +785,14 @@ final class CheckMainViewModelTests: XCTestCase {
         XCTAssertTrue(disabled)
         XCTAssertFalse(monitorActive)
         XCTAssertGreaterThan(unregistersAfter, unregistersBefore)
-        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, invalidationsBefore + 1)
+        XCTAssertEqual(
+            h.orchestrator.beginAutomationContextTransitionCount,
+            transitionsBefore + 1
+        )
+        XCTAssertEqual(
+            h.orchestrator.endAutomationContextTransitionCount,
+            transitionEndsBefore + 1
+        )
         h.teardown()
     }
 
@@ -752,6 +815,30 @@ final class CheckMainViewModelTests: XCTestCase {
         h.teardown()
     }
 
+    func test_activeProjectChangeRemovesPreviousGeofencesBeforeReregistration() async {
+        let (h, vm) = await authenticatedHarness(
+            userProjects: UserProjects(projects: ["P80", "P81"], activeProject: "P80")
+        )
+        vm.recordBackgroundLocationConsent()
+        _ = await vm.setAutomaticActivitiesEnabled(true)
+        let unregistersBefore = await h.geofenceRegionManager.unregisterCount
+        h.projects.updateUserProjectsResult = .success(
+            UserProjects(projects: ["P81"], activeProject: "P81")
+        )
+
+        vm.onProjectMembershipToggled("P80")
+        await settle {
+            vm.uiState.userProjects?.activeProject == "P81" &&
+                !vm.uiState.isProjectMembershipSyncing
+        }
+
+        let unregistersAfter = await h.geofenceRegionManager.unregisterCount
+        let lastRegistration = await h.geofenceRegionManager.registrations.last
+        XCTAssertGreaterThan(unregistersAfter, unregistersBefore)
+        XCTAssertTrue(lastRegistration?.forceRefresh == true)
+        h.teardown()
+    }
+
     func test_privacyLocalDeletionStopsMonitoringAndWipesDeviceStores() async throws {
         let (h, vm) = await authenticatedHarness()
         await h.offlineQueue.enqueue(.decided(PendingCheckEvent.Decided(
@@ -763,6 +850,9 @@ final class CheckMainViewModelTests: XCTestCase {
             description: "private local event", location: "Escritório Principal"))
         vm.recordBackgroundLocationConsent()
         _ = await vm.setAutomaticActivitiesEnabled(true)
+        let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
+        let quiescencesBefore = h.orchestrator.awaitAutomationQuiescenceCount
+        let transitionEndsBefore = h.orchestrator.endAutomationContextTransitionCount
 
         await vm.deleteLocalData()
 
@@ -774,45 +864,325 @@ final class CheckMainViewModelTests: XCTestCase {
         XCTAssertEqual(settingsJSON, "")
         XCTAssertTrue(h.passwords.getAllPasswords().isEmpty)
         XCTAssertEqual(h.offlineQueue.clearCount, 1)
+        let journalClearCount = await h.evaluationJournal.clearCount
+        XCTAssertEqual(journalClearCount, 1)
         XCTAssertTrue(h.offlineQueue.enqueued.isEmpty)
         XCTAssertEqual(h.activityLog.count(), 0)
         XCTAssertEqual(vm.uiState.chave, "")
         XCTAssertFalse(vm.uiState.isAuthenticated)
         let geofenceUnregisterCount = await h.geofenceRegionManager.unregisterCount
         XCTAssertGreaterThan(geofenceUnregisterCount, 0)
+        XCTAssertEqual(
+            h.orchestrator.beginAutomationContextTransitionCount,
+            transitionsBefore + 1
+        )
+        XCTAssertEqual(
+            h.orchestrator.awaitAutomationQuiescenceCount,
+            quiescencesBefore + 1
+        )
+        XCTAssertEqual(
+            h.orchestrator.endAutomationContextTransitionCount,
+            transitionEndsBefore + 1
+        )
         h.teardown()
+    }
+
+    func test_privacyLocalDeletionRemovesDurableJournalFile() async throws {
+        let h = VMHarness()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-wipe-durable-journal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            h.teardown()
+        }
+        let journalFile = root.appendingPathComponent("journal.json")
+        let journal = DurableEvaluationJournal(
+            fileURL: journalFile,
+            clock: FixedClock(Date(timeIntervalSince1970: 10))
+        )
+        await journal.begin(EvaluationStart(
+            trigger: .foreground,
+            primaryWake: .foreground
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: journalFile.path))
+        let vm = h.build(
+            evaluationJournal: journal,
+            initialState: CheckUiState(
+                isInitializing: false,
+                chave: "HR70",
+                authStatus: authenticated
+            )
+        )
+
+        await vm.deleteLocalData()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journalFile.path))
     }
 
     func test_successfulAccountDeletionWipesOfflineQueue() async {
         let (h, vm) = await authenticatedHarness()
+        defer { EvaluationLog.shared.reset() }
+        EvaluationLog.shared.reset()
         await h.offlineQueue.enqueue(.decided(PendingCheckEvent.Decided(
             chave: "HR70", projeto: "P80", capturedAtEpochMs: 1,
             clientEventId: "private-pending-event", action: "checkin",
             local: "Escritório Principal", informe: "normal")))
+        try? h.activityLog.record(ActivityLogEntry(
+            at: Date(), actor: .user, kind: .trigger, severity: .info,
+            description: "private diagnostic event", location: "Escritório Principal"
+        ))
+        EvaluationLog.shared.record(EvaluationEntry(
+            at: Date(),
+            trigger: .geofence,
+            accuracyMeters: 10,
+            resolvedLocal: "Escritório Principal",
+            decidedAction: "CHECKIN",
+            outcome: .submitted
+        ))
+        let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
+        let quiescencesBefore = h.orchestrator.awaitAutomationQuiescenceCount
+        let transitionEndsBefore = h.orchestrator.endAutomationContextTransitionCount
+        let logoutCallsBefore = h.auth.logoutCallCount
 
         vm.deleteAccount()
-        await settle { vm.uiState.chave.isEmpty }
+        await settle {
+            vm.uiState.chave.isEmpty
+                && h.orchestrator.endAutomationContextTransitionCount
+                    == transitionEndsBefore + 1
+        }
 
         XCTAssertEqual(h.offlineQueue.clearCount, 1)
+        let journalClearCount = await h.evaluationJournal.clearCount
+        XCTAssertEqual(journalClearCount, 1)
         XCTAssertTrue(h.offlineQueue.enqueued.isEmpty)
+        XCTAssertEqual(h.activityLog.count(), 0)
+        XCTAssertTrue(EvaluationLog.shared.isEmpty())
         XCTAssertFalse(vm.uiState.isAuthenticated)
+        XCTAssertEqual(
+            h.auth.logoutCallCount,
+            logoutCallsBefore,
+            "DELETE aceito já encerra a sessão; não deve disparar um POST logout redundante"
+        )
+        XCTAssertEqual(
+            h.orchestrator.beginAutomationContextTransitionCount,
+            transitionsBefore + 1
+        )
+        XCTAssertEqual(
+            h.orchestrator.awaitAutomationQuiescenceCount,
+            quiescencesBefore + 1
+        )
+        h.teardown()
+    }
+
+    func test_successfulAccountDeletionRemovesDurableJournalFileOnlyAfterServerSuccess() async throws {
+        let h = VMHarness()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("account-delete-durable-journal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            h.teardown()
+        }
+        let journalFile = root.appendingPathComponent("journal.json")
+        let journal = DurableEvaluationJournal(
+            fileURL: journalFile,
+            clock: FixedClock(Date(timeIntervalSince1970: 10))
+        )
+        await journal.begin(EvaluationStart(
+            trigger: .foreground,
+            primaryWake: .foreground
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: journalFile.path))
+        let vm = h.build(
+            evaluationJournal: journal,
+            initialState: CheckUiState(
+                isInitializing: false,
+                chave: "HR70",
+                authStatus: authenticated
+            )
+        )
+
+        vm.deleteAccount()
+        await settle {
+            !FileManager.default.fileExists(atPath: journalFile.path)
+                && !vm.uiState.isAuthenticated
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journalFile.path))
+    }
+
+    func test_sameKeyLoginResponseIsNotAdoptedAfterAuthExpiryInvalidatesSession() async {
+        let (h, vm) = await authenticatedHarness()
+        let loginCallsBefore = h.auth.loginCalls.count
+        let logoutCallsBefore = h.auth.logoutCallCount
+        let loginGate = AsyncGate()
+        let logoutGate = AsyncGate()
+        h.auth.loginGates["HR70"] = loginGate
+        h.auth.nextLogoutGate = logoutGate
+        h.auth.simulatedAuthenticationResponseCookie = "late-same-key-cookie"
+        h.checkRepository.getStateResult = .failure(.unauthorized)
+
+        vm.submitLogin()
+        await settle { h.auth.loginCalls.count == loginCallsBefore + 1 }
+        vm.onForegroundResume()
+        await settle { !vm.uiState.isAuthenticated }
+
+        await loginGate.release()
+        await settle { h.auth.logoutCallCount == logoutCallsBefore + 1 }
+
+        XCTAssertFalse(
+            vm.uiState.isAuthenticated,
+            "a resposta da geração invalidada não pode reautenticar a mesma chave"
+        )
+        XCTAssertNil(
+            h.auth.simulatedPersistedSessionCookie,
+            "Set-Cookie tardio deve ser rejeitado enquanto o logout ainda está bloqueado"
+        )
+        await logoutGate.release()
+        h.teardown()
+    }
+
+    func test_accountDeletionInFlightDoesNotEnqueueInteractiveLogin() async {
+        let (h, vm) = await authenticatedHarness()
+        let deleteGate = AsyncGate()
+        h.auth.deleteGate = deleteGate
+        let loginCallsBefore = h.auth.loginCalls.count
+
+        vm.deleteAccount()
+        await settle { h.auth.deleteCallCount == 1 }
+        vm.submitLogin()
+        try? await Task.sleep(for: .milliseconds(30))
+
+        XCTAssertEqual(h.auth.loginCalls.count, loginCallsBefore)
+
+        await deleteGate.release()
+        await settle { vm.uiState.chave.isEmpty }
+        XCTAssertEqual(h.auth.loginCalls.count, loginCallsBefore)
+        h.teardown()
+    }
+
+    func test_successfulAccountDeletionDrainsCancelledManualSubmitBeforeWipe() async {
+        let submitGate = AsyncGate()
+        let (h, vm) = await authenticatedHarness(submitResult: .failure(.network))
+        h.checkRepository.submitGate = submitGate
+        vm.onManualLocationSelected("Unidade P80")
+        let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
+
+        vm.onSubmit()
+        await settle { h.checkRepository.submitCount == 1 }
+        vm.deleteAccount()
+        await settle {
+            h.orchestrator.beginAutomationContextTransitionCount
+                == transitionsBefore + 1
+        }
+
+        XCTAssertEqual(h.offlineQueue.clearCount, 0)
+        XCTAssertTrue(h.offlineQueue.enqueued.isEmpty)
+
+        await submitGate.release()
+        await settle {
+            h.offlineQueue.clearCount == 1
+                && h.orchestrator.endAutomationContextTransitionCount > 0
+        }
+
+        XCTAssertTrue(h.offlineQueue.enqueued.isEmpty)
+        XCTAssertEqual(h.orchestrator.invalidateAccuracyRetryCount, 0)
+        XCTAssertFalse(vm.uiState.isAuthenticated)
+        h.teardown()
+    }
+
+    func test_successfulAccountDeletionDrainsSettingsReconciliationBeforeWipe() async {
+        let reconciliationGate = AsyncGate()
+        let (h, vm) = await authenticatedHarness()
+        h.orchestrator.nextRunGate = reconciliationGate
+        let runsBefore = h.orchestrator.runOnceCalls.count
+        let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
+
+        vm.onNotificationSettingsChanged(
+            activities: true,
+            scheduledPause: false,
+            accident: false
+        )
+        await settle { h.orchestrator.runOnceCalls.count == runsBefore + 1 }
+
+        vm.deleteAccount()
+        await settle {
+            h.orchestrator.beginAutomationContextTransitionCount
+                == transitionsBefore + 1
+        }
+        XCTAssertEqual(h.offlineQueue.clearCount, 0)
+
+        await reconciliationGate.release()
+        await settle {
+            h.offlineQueue.clearCount == 1
+                && !vm.uiState.isAuthenticated
+        }
+
+        XCTAssertTrue(h.offlineQueue.enqueued.isEmpty)
         h.teardown()
     }
 
     func test_conflictedAccountDeletionPreservesOfflineQueueAndSession() async {
         let (h, vm) = await authenticatedHarness()
+        defer { EvaluationLog.shared.reset() }
+        EvaluationLog.shared.reset()
         h.auth.deleteResult = .failure(.conflict)
+        let deleteGate = AsyncGate()
+        h.auth.deleteGate = deleteGate
+        let transitionsBefore = h.orchestrator.beginAutomationContextTransitionCount
+        let quiescencesBefore = h.orchestrator.awaitAutomationQuiescenceCount
+        let transitionEndsBefore = h.orchestrator.endAutomationContextTransitionCount
         await h.offlineQueue.enqueue(.decided(PendingCheckEvent.Decided(
             chave: "HR70", projeto: "P80", capturedAtEpochMs: 1,
             clientEventId: "private-pending-event", action: "checkin",
             local: "Escritório Principal", informe: "normal")))
+        try? h.activityLog.record(ActivityLogEntry(
+            at: Date(), actor: .user, kind: .trigger, severity: .info,
+            description: "private diagnostic event", location: "Escritório Principal"
+        ))
+        EvaluationLog.shared.record(EvaluationEntry(
+            at: Date(),
+            trigger: .geofence,
+            accuracyMeters: 10,
+            resolvedLocal: "Escritório Principal",
+            decidedAction: "CHECKIN",
+            outcome: .submitted
+        ))
 
         vm.deleteAccount()
+        await settle { h.auth.deleteCallCount == 1 }
+        XCTAssertEqual(
+            h.orchestrator.beginAutomationContextTransitionCount,
+            transitionsBefore,
+            "DELETE ainda não é wipe antes de o servidor confirmar sucesso")
+        XCTAssertEqual(
+            h.orchestrator.endAutomationContextTransitionCount,
+            transitionEndsBefore
+        )
+
+        await deleteGate.release()
         await settle { vm.uiState.notificationTone == .error }
 
         XCTAssertEqual(h.offlineQueue.clearCount, 0)
+        let journalClearCount = await h.evaluationJournal.clearCount
+        XCTAssertEqual(journalClearCount, 0)
         XCTAssertEqual(h.offlineQueue.enqueued.count, 1)
+        XCTAssertEqual(h.activityLog.count(), 1)
+        XCTAssertFalse(EvaluationLog.shared.isEmpty())
         XCTAssertTrue(vm.uiState.isAuthenticated)
+        XCTAssertEqual(
+            h.orchestrator.beginAutomationContextTransitionCount,
+            transitionsBefore
+        )
+        XCTAssertEqual(
+            h.orchestrator.awaitAutomationQuiescenceCount,
+            quiescencesBefore
+        )
+        XCTAssertEqual(
+            h.orchestrator.endAutomationContextTransitionCount,
+            transitionEndsBefore
+        )
         h.teardown()
     }
 }

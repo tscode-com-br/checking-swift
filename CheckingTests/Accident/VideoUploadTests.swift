@@ -125,6 +125,57 @@ final class VideoUploadTests: XCTestCase {
         XCTAssertTrue(text.hasSuffix("--Boundary-Test--\r\n"))
     }
 
+    func test_backgroundUploaderRejectsSetCookieFromInvalidatedGeneration() {
+        let store = InMemorySessionCookieStore(now: { 1_000 })
+        let url = URL(string: "https://example.invalid/api/web/check/accident/video")!
+        let uploader = BackgroundAccidentVideoUploader(
+            baseURL: URL(string: "https://example.invalid/api/web/")!,
+            xClient: "checking-ios",
+            cookieStore: store)
+        let staleSnapshot = store.requestSnapshot(for: url)
+
+        store.invalidateInFlightResponses()
+        uploader.adoptResponseCookies(
+            for: url,
+            headerFields: ["Set-Cookie": "session=stale-upload-response; Path=/"],
+            requestGeneration: staleSnapshot.generation)
+
+        XCTAssertNil(store.cookieHeader(for: url))
+    }
+
+    func test_backgroundUploaderRestoredTaskWithoutGenerationDoesNotAdoptSetCookie() {
+        let store = InMemorySessionCookieStore(now: { 1_000 })
+        let url = URL(string: "https://example.invalid/api/web/check/accident/video")!
+        let uploader = BackgroundAccidentVideoUploader(
+            baseURL: URL(string: "https://example.invalid/api/web/")!,
+            xClient: "checking-ios",
+            cookieStore: store)
+
+        uploader.adoptResponseCookies(
+            for: url,
+            headerFields: ["Set-Cookie": "session=restored-upload-response; Path=/"],
+            requestGeneration: nil)
+
+        XCTAssertNil(store.cookieHeader(for: url))
+    }
+
+    func test_backgroundUploaderCurrentGenerationAdoptsSetCookie() {
+        let store = InMemorySessionCookieStore(now: { 1_000 })
+        let url = URL(string: "https://example.invalid/api/web/check/accident/video")!
+        let uploader = BackgroundAccidentVideoUploader(
+            baseURL: URL(string: "https://example.invalid/api/web/")!,
+            xClient: "checking-ios",
+            cookieStore: store)
+        let snapshot = store.requestSnapshot(for: url)
+
+        uploader.adoptResponseCookies(
+            for: url,
+            headerFields: ["Set-Cookie": "session=current-upload-response; Path=/"],
+            requestGeneration: snapshot.generation)
+
+        XCTAssertEqual(store.cookieHeader(for: url), "session=current-upload-response")
+    }
+
     func test_repository_usesBackgroundUploaderAndDecodesResponse() async throws {
         let uploader = FakeAccidentVideoUploader()
         uploader.responseData = Data(

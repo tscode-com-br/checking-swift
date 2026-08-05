@@ -1,6 +1,30 @@
 # Piloto TestFlight — Checking iOS
 
-## Candidata preparada
+## Estado vinculante — preparação solicitada; distribuição bloqueada (2026-08-05)
+
+O owner solicitou a preparação de uma candidata para TestFlight. Isso não é autorização final de
+distribuição: não houve archive, assinatura de distribuição ou upload da candidata TestFlight. `Debug`,
+`Staging` e `Release` persistem em `legacyWithDiagnostics`; o candidato foi exercitado por injeção/override
+temporário e a configuração isolada, não-shipping, `PhysicalValidation` serve somente ao pré-voo agregado.
+Ela não promove o perfil de Release. Esta página continua sendo um runbook condicional enquanto os gates
+técnicos, físicos, de backend e de App Store Connect não estiverem resolvidos.
+
+O rollout, se aprovado em decisões futuras, deve avançar estritamente nesta ordem:
+
+| Etapa | Gate antes de avançar | Estado atual |
+|---|---|---|
+| Diagnósticos locais | unitários, UI, Simulator, privacidade e diff auditados | evidência local concluída; não é gate físico |
+| Candidato interno | gates de backend/físicos resolvidos, artefato exato e aprovação final de produto/release | preparação solicitada; bloqueado pelos gates |
+| Coorte pequena | owner aprova resultados internos e critérios de segurança/privacidade | pendente |
+| 25% | sem P0/P1, métricas/feedback revisados pelo owner | pendente |
+| 100% | aceite formal de produto/release e todos os gates externos resolvidos | pendente |
+
+O owner nominal de produto/release, o owner de backend e os respectivos prazos de aprovação não estão
+identificados no workspace; devem ser registrados antes de qualquer upload. Hotfix/rollback exige interromper
+a expansão, avaliar o incidente e entregar build/revert substituto. O profile não oferece kill switch remoto.
+Nenhum upload deve ser tentado para "testar" os gates.
+
+## Registro histórico — não é a candidata atual
 
 - versão: `1.6.5`;
 - build: `25`;
@@ -15,11 +39,11 @@
 - `ITSAppUsesNonExemptEncryption = false`;
 - Validação Física, harness e demais instrumentos `DEBUG` ausentes do binário.
 
-O archive foi criado com assinatura Apple Development. Na distribuição pelo Organizer, o Xcode deve
-reassinar a aplicação com Apple Distribution gerenciada pela nuvem. Isso exige que a conta conectada ao
-Xcode tenha permissão de distribuição para a equipe `F8Z6CMJHAR`.
+O archive abaixo é registro histórico e não deve ser enviado sem uma nova autorização explícita. Na eventual
+distribuição aprovada, o Xcode deve usar assinatura de distribuição apropriada; esta nota não delega essa
+decisão nem autoriza upload.
 
-## Escopo e limitações declaradas do piloto
+## Escopo e limitações históricas do piloto
 
 Incluído:
 
@@ -45,7 +69,7 @@ Não incluído ou ainda não homologado:
 Os testadores não devem reportar acidentes reais nem acionar chamadas de emergência durante o piloto. O
 botão só deve ser exercitado em roteiro previamente combinado e ambiente seguro.
 
-## 1. Pré-requisitos da conta Apple
+## 1. Pré-requisitos da conta Apple — após gate de distribuição
 
 1. Confirmar que o contrato mais recente do Apple Developer Program está aceito.
 2. Confirmar acesso ao App Store Connect como Account Holder, Admin ou App Manager; Developer também pode
@@ -62,13 +86,13 @@ botão só deve ser exercitado em roteiro previamente combinado e ambiente segur
 5. Em **Xcode › Settings › Accounts**, confirmar a mesma equipe e, em **Manage Certificates**, permitir
    assinatura Apple Distribution/cloud-managed.
 
-## 2. Upload pelo Xcode Organizer
+## 2. Upload pelo Xcode Organizer — somente após autorização explícita
 
 1. Abrir `.build/archives/Checking-1.6.5-25.xcarchive`.
 2. Selecionar o archive **Checking 1.6.5 (25)**.
 3. Clicar **Distribute App**.
-4. Escolher **App Store Connect** e **Upload**; não selecionar “TestFlight Internal Only”, porque queremos
-   permitir um grupo externo depois da revisão beta.
+4. Escolher **App Store Connect** e **Upload** somente se o gate autorizar; não selecionar “TestFlight
+   Internal Only” apenas quando a progressão aprovada incluir grupo externo depois da revisão beta.
 5. Manter assinatura automática e upload de símbolos habilitados.
 6. Confirmar que o resumo mostra equipe `F8Z6CMJHAR`, bundle `br.com.tscode.checking`, versão `1.6.5` e build
    `25`.
@@ -78,7 +102,7 @@ botão só deve ser exercitado em roteiro previamente combinado e ambiente segur
 Depois do upload, aguardar o processamento no App Store Connect. Não repetir o upload do mesmo build enquanto
 o estado for `Processing`. Um novo binário exige incrementar o build para `26`, `27` etc.
 
-## 3. Configuração do build no App Store Connect
+## 3. Configuração do build no App Store Connect — após upload autorizado
 
 1. Abrir **Apps › Checking › TestFlight › iOS** e selecionar `1.6.5 (25)`.
 2. Resolver a declaração de conformidade de exportação. O app não implementa criptografia proprietária;
@@ -94,7 +118,7 @@ o estado for `Processing`. Um novo binário exige incrementar o build para `26`,
    precisa, identificador do usuário, nome/e-mail, conteúdo livre, fotos/vídeos e áudio; vinculados ao usuário,
    usados para funcionalidade e sem tracking. Fazer revisão jurídica antes de publicação pública.
 
-## 4. Primeiro grupo interno
+## 4. Primeiro grupo interno — após aprovação do candidato interno
 
 Antes do grupo externo, criar **Internal Testing › Equipe Interna**. Testadores internos precisam ser usuários
 do App Store Connect e podem ter acesso ao conteúdo da conta; por isso, não transformar usuários comuns em
@@ -110,7 +134,7 @@ Adicionar inicialmente apenas responsáveis reais pelo projeto. Associar o build
 - ausência da opção Validação Física;
 - ícone, nome e versão corretos.
 
-## 5. Grupo externo selecionado
+## 5. Grupo externo selecionado — após aprovação da coorte pequena
 
 1. Criar **External Testing › Piloto Inicial**.
 2. Adicionar o build `1.6.5 (25)`.
@@ -166,10 +190,14 @@ independentes. Cada testador deverá autenticar e conceder permissões novamente
 
 ## 7. Acompanhamento e encerramento
 
-- começar com 3–5 pessoas e ampliar somente depois de 48 horas sem P0/P1;
+- depois do candidato interno autorizado, começar com coorte pequena de 3–5 pessoas; ampliar para 25% e 100%
+  somente com aceite explícito do owner de produto/release e ausência dos critérios de bloqueio definidos;
 - revisar diariamente crashes, sessões e feedback no App Store Connect;
 - manter uma planilha sem coordenadas com dispositivo, iOS, cenário, resultado e bateria;
-- expirar imediatamente a build se houver atividade incorreta, exposição de dados ou falha de Acidentes;
-- corrigir, incrementar `CURRENT_PROJECT_VERSION` e repetir regressão/archive/upload;
+- diante de atividade incorreta, exposição de dados ou falha crítica, interromper a expansão, acionar o
+  owner/hotfix e decidir por remover a disponibilidade da build e substituir por build/revert; não existe
+  rollback remoto pelo profile;
+- corrigir, incrementar `CURRENT_PROJECT_VERSION` e repetir os gates de regressão/artefato antes de qualquer
+  novo upload autorizado;
 - builds TestFlight expiram após 90 dias;
 - o piloto não autoriza publicação na App Store; lançamento público exige os gates restantes da Fase 10/11.

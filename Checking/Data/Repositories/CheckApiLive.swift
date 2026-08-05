@@ -17,11 +17,48 @@ struct CheckApiLive: CheckApi {
     func matchLocation(_ body: WebLocationMatchRequest) async throws -> WebLocationMatchResponse {
         try decode(await http.data(for: HTTPRequest(method: .post, path: "check/location", body: try JSONCoding.encoder.encode(body))))
     }
+
+    func matchLocation(
+        _ body: WebLocationMatchRequest,
+        dispatchAuthorization: HTTPRequestDispatchAuthorization
+    ) async throws -> GuardedOperationResult<WebLocationMatchResponse> {
+        var request = HTTPRequest(
+            method: .post,
+            path: "check/location",
+            body: try JSONCoding.encoder.encode(body)
+        )
+        request.dispatchAuthorization = dispatchAuthorization
+        switch try await http.dataIfAuthorized(for: request) {
+        case .notDispatched:
+            return .notDispatched
+        case .dispatched(let data):
+            return .dispatched(try decode(data))
+        }
+    }
     func getGeofences(_ chave: String) async throws -> WebGeofencesResponse {
         try decode(await http.data(for: HTTPRequest(method: .get, path: "check/geofences", query: ["chave": chave])))
     }
     func submit(_ body: WebCheckSubmitRequest) async throws -> MobileSubmitResponse {
         try decode(await http.data(for: HTTPRequest(method: .post, path: "check", body: try JSONCoding.encoder.encode(body))))
+    }
+
+
+    func submit(
+        _ body: WebCheckSubmitRequest,
+        dispatchAuthorization: HTTPRequestDispatchAuthorization
+    ) async throws -> GuardedOperationResult<MobileSubmitResponse> {
+        var request = HTTPRequest(
+            method: .post,
+            path: "check",
+            body: try JSONCoding.encoder.encode(body)
+        )
+        request.dispatchAuthorization = dispatchAuthorization
+        switch try await http.dataIfAuthorized(for: request) {
+        case .notDispatched:
+            return .notDispatched
+        case .dispatched(let data):
+            return .dispatched(try decode(data))
+        }
     }
 
     private func decode<T: Decodable>(_ data: Data) throws -> T {

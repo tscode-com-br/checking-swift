@@ -3,6 +3,142 @@ import XCTest
 
 // Port de PendingCheckReplayerTest.kt — drain/decide/taxonomia/24h/exactly-once. §9.2.
 final class PendingCheckReplayerTests: XCTestCase {
+    private enum SuspendedRepositoryStage: CaseIterable {
+        case match
+        case state
+        case options
+        case submit
+    }
+
+    private final class CancellationStageRepository: CheckRepository, @unchecked Sendable {
+        struct SubmitCall: Sendable, Equatable {
+            let chave: String
+            let projeto: String
+            let action: CheckAction
+            let local: String?
+            let informe: InformeType
+            let eventTime: Date
+            let clientEventId: String
+            let fillForms: Bool
+        }
+
+        private let suspendedStage: SuspendedRepositoryStage
+        private let gate = AsyncGate()
+        private let lock = NSLock()
+        private var started = false
+        private var recordedSubmitCalls: [SubmitCall] = []
+
+        init(suspendedStage: SuspendedRepositoryStage) {
+            self.suspendedStage = suspendedStage
+        }
+
+        var didStartSuspendedStage: Bool { lock.withLock { started } }
+        var submitCalls: [SubmitCall] { lock.withLock { recordedSubmitCalls } }
+
+        func release() async {
+            await gate.release()
+        }
+
+        func matchLocation(
+            _ lat: Double,
+            _ lon: Double,
+            _ accuracyMeters: Double?
+        ) async -> AppResult<LocationMatch> {
+            if await suspendIfTarget(.match) {
+                return .failure(.unknown(description: nil))
+            }
+            return .success(LocationMatch(
+                matched: true,
+                resolvedLocal: "Unidade P80",
+                label: "Unidade P80",
+                status: .matched,
+                message: "",
+                accuracyMeters: 10,
+                accuracyThresholdMeters: 50,
+                minimumCheckoutDistanceMeters: 2_000,
+                nearestWorkplaceDistanceMeters: nil
+            ))
+        }
+
+        func getState(_ chave: String) async -> AppResult<HistoryState> {
+            if await suspendIfTarget(.state) {
+                return .failure(.unknown(description: nil))
+            }
+            return .success(HistoryState(
+                found: true,
+                chave: chave,
+                projeto: "P80",
+                currentAction: .checkOut,
+                currentLocal: nil,
+                hasCurrentDayCheckin: false,
+                lastCheckinAt: nil,
+                lastCheckoutAt: Date(timeIntervalSince1970: 1),
+                transportEnabled: false
+            ))
+        }
+
+        func getHistory(_ chave: String) async -> AppResult<[CheckHistoryEntry]> { .success([]) }
+
+        func getLocations() async -> AppResult<LocationOptions> {
+            if await suspendIfTarget(.options) {
+                return .failure(.unknown(description: nil))
+            }
+            return .success(LocationOptions(
+                items: ["Unidade P80"],
+                accuracyThresholdMeters: 50,
+                mixedZoneIntervalMinutes: 15
+            ))
+        }
+
+        func getGeofences(_ chave: String) async -> AppResult<[GeofenceCircle]> { .success([]) }
+
+        func submit(
+            chave: String,
+            projeto: String,
+            action: CheckAction,
+            local: String?,
+            informe: InformeType,
+            eventTime: Date,
+            clientEventId: String,
+            fillForms: Bool
+        ) async -> AppResult<HistoryState> {
+            lock.withLock {
+                recordedSubmitCalls.append(SubmitCall(
+                    chave: chave,
+                    projeto: projeto,
+                    action: action,
+                    local: local,
+                    informe: informe,
+                    eventTime: eventTime,
+                    clientEventId: clientEventId,
+                    fillForms: fillForms
+                ))
+            }
+            if await suspendIfTarget(.submit) {
+                // Espelha o boundary real: cancellation do transporte é reduzido a `.unknown` pelo
+                // safeApiCall, mas o replayer ainda enxerga `Task.isCancelled` e conserva o handoff.
+                return .failure(.unknown(description: nil))
+            }
+            return .success(HistoryState(
+                found: true,
+                chave: chave,
+                projeto: projeto,
+                currentAction: action,
+                currentLocal: local,
+                hasCurrentDayCheckin: action == .checkIn,
+                lastCheckinAt: action == .checkIn ? eventTime : nil,
+                lastCheckoutAt: action == .checkOut ? eventTime : nil,
+                transportEnabled: false
+            ))
+        }
+
+        private func suspendIfTarget(_ stage: SuspendedRepositoryStage) async -> Bool {
+            guard stage == suspendedStage else { return false }
+            lock.withLock { started = true }
+            await gate.wait()
+            return Task.isCancelled
+        }
+    }
 
     private let chave = "HR70"
     private let projeto = "P80"
@@ -192,5 +328,78 @@ final class PendingCheckReplayerTests: XCTestCase {
 
         XCTAssertEqual(result, .retry)
         XCTAssertTrue(observer.acceptedChecks.isEmpty)
+    }
+
+    func test_cancellationDuringRawMatchStateOrOptionsReturnsRetryAndKeepsEvent() async {
+        for stage in [
+            SuspendedRepositoryStage.match,
+            .state,
+            .options,
+        ] {
+            let event = raw("cancel-\(stage)", at: 2_000)
+            let queue = FakePendingCheckQueue([event])
+            let repository = CancellationStageRepository(suspendedStage: stage)
+            let logger = RecordingActivityLogger()
+            let replayer = PendingCheckReplayer(
+                queue: queue,
+                repository: repository,
+                logger: logger
+            )
+
+            let task = Task { await replayer.drain() }
+            await waitUntil { repository.didStartSuspendedStage }
+            XCTAssertTrue(repository.didStartSuspendedStage, "stage \(stage) did not start")
+            task.cancel()
+            await repository.release()
+            let result = await task.value
+            let pending = await queue.pending
+
+            XCTAssertEqual(result, .retry, "stage \(stage)")
+            XCTAssertEqual(pending, [event], "stage \(stage)")
+            XCTAssertTrue(logger.synced.isEmpty, "stage \(stage)")
+            XCTAssertTrue(logger.dropped.isEmpty, "stage \(stage)")
+        }
+    }
+
+    func test_indeterminateSubmitResponseAfterCancellationReturnsRetryAndKeepsExactEvent() async {
+        let event = decided(
+            "indeterminate-submit",
+            at: 1_234,
+            action: "checkout",
+            local: "Zona Mista"
+        )
+        let queue = FakePendingCheckQueue([event])
+        let repository = CancellationStageRepository(suspendedStage: .submit)
+        let logger = RecordingActivityLogger()
+        let replayer = PendingCheckReplayer(
+            queue: queue,
+            repository: repository,
+            logger: logger
+        )
+
+        let task = Task { await replayer.drain() }
+        await waitUntil { repository.didStartSuspendedStage }
+        XCTAssertTrue(repository.didStartSuspendedStage)
+        task.cancel()
+        await repository.release()
+        let result = await task.value
+        let pending = await queue.pending
+
+        XCTAssertEqual(result, .retry)
+        XCTAssertEqual(pending, [event])
+        XCTAssertEqual(repository.submitCalls, [
+            .init(
+                chave: chave,
+                projeto: projeto,
+                action: .checkOut,
+                local: "Zona Mista",
+                informe: .normal,
+                eventTime: Date(timeIntervalSince1970: 1.234),
+                clientEventId: "indeterminate-submit",
+                fillForms: true
+            ),
+        ])
+        XCTAssertTrue(logger.synced.isEmpty)
+        XCTAssertTrue(logger.dropped.isEmpty)
     }
 }

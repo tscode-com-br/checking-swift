@@ -42,6 +42,33 @@ final class CheckRepositoryLive: CheckRepository, @unchecked Sendable {
         }
     }
 
+    func matchLocation(
+        _ lat: Double,
+        _ lon: Double,
+        _ accuracyMeters: Double?,
+        effectGuard: AutomaticActivitiesEffectGuard
+    ) async -> GuardedOperationResult<AppResult<LocationMatch>> {
+        let authorization = dispatchAuthorization(for: effectGuard)
+        let result = await safeApiCall {
+            try await api.matchLocation(
+                WebLocationMatchRequest(
+                    latitude: lat,
+                    longitude: lon,
+                    accuracyMeters: accuracyMeters
+                ),
+                dispatchAuthorization: authorization
+            )
+        }
+        switch result {
+        case .success(.notDispatched):
+            return .notDispatched
+        case .success(.dispatched(let response)):
+            return .dispatched(.success(response.toDomain()))
+        case .failure(let error):
+            return .dispatched(.failure(error))
+        }
+    }
+
     func submit(chave: String, projeto: String, action: CheckAction, local: String?, informe: InformeType,
                 eventTime: Date, clientEventId: String, fillForms: Bool) async -> AppResult<HistoryState> {
         await safeApiCall {
@@ -49,6 +76,44 @@ final class CheckRepositoryLive: CheckRepository, @unchecked Sendable {
                 chave: chave, projeto: projeto, action: action.toDto(), local: local, informe: informe.toDto(),
                 eventTime: ISOInstant.string(eventTime), clientEventId: clientEventId, fillForms: fillForms)
             return try await api.submit(request).state.toHistoryState()
+        }
+    }
+
+    func submit(
+        chave: String,
+        projeto: String,
+        action: CheckAction,
+        local: String?,
+        informe: InformeType,
+        eventTime: Date,
+        clientEventId: String,
+        fillForms: Bool,
+        effectGuard: AutomaticActivitiesEffectGuard
+    ) async -> GuardedOperationResult<AppResult<HistoryState>> {
+        let request = WebCheckSubmitRequest(
+            chave: chave,
+            projeto: projeto,
+            action: action.toDto(),
+            local: local,
+            informe: informe.toDto(),
+            eventTime: ISOInstant.string(eventTime),
+            clientEventId: clientEventId,
+            fillForms: fillForms
+        )
+        let authorization = dispatchAuthorization(for: effectGuard)
+        let result = await safeApiCall {
+            try await api.submit(
+                request,
+                dispatchAuthorization: authorization
+            )
+        }
+        switch result {
+        case .success(.notDispatched):
+            return .notDispatched
+        case .success(.dispatched(let response)):
+            return .dispatched(.success(response.state.toHistoryState()))
+        case .failure(let error):
+            return .dispatched(.failure(error))
         }
     }
 
@@ -77,6 +142,14 @@ final class CheckRepositoryLive: CheckRepository, @unchecked Sendable {
             geofenceCachedAt = nil
         }
     }
+}
+
+private func dispatchAuthorization(
+    for effectGuard: AutomaticActivitiesEffectGuard
+) -> HTTPRequestDispatchAuthorization {
+    HTTPRequestDispatchAuthorization(performIfAuthorized: { operation in
+        effectGuard.performIfCurrent(operation)
+    })
 }
 
 // MARK: - DTO → domínio (mappers 1:1, exatos do CheckRepositoryImpl.kt)

@@ -1,3 +1,4 @@
+#if DEBUG
 import SwiftUI
 import UIKit
 
@@ -13,11 +14,16 @@ struct PhysicalValidationScreen: View {
     @State private var permissions: PermissionsStatus?
     @State private var consentGranted = false
     @State private var geofenceSummary: GeofenceRegistrationSummary?
+    @State private var geofenceSnapshot: GeofenceMonitoringSnapshot?
     @State private var evaluation: EvaluationEntry?
     @State private var validationEventCount = 0
     @State private var latestValidationEvent = "Nenhum evento registrado"
     @State private var isWorking = false
     @State private var operationMessage = ""
+#if DEBUG
+    @State private var isPreparingDiagnosticsExport = false
+    @State private var diagnosticsExport: DiagnosticsExportFile?
+#endif
 
     var body: some View {
         CheckScreenShell(
@@ -45,6 +51,15 @@ struct PhysicalValidationScreen: View {
             guard authenticated else { return }
             Task { await refreshDiagnostics() }
         }
+#if DEBUG
+        .sheet(item: $diagnosticsExport, onDismiss: removeDiagnosticsExport) { export in
+            EvaluationDiagnosticsActivitySheet(
+                exportURL: export.url,
+                onCompletion: removeDiagnosticsExport
+            )
+        }
+        .onDisappear(perform: removeDiagnosticsExport)
+#endif
     }
 
     private var introSection: some View {
@@ -152,7 +167,7 @@ struct PhysicalValidationScreen: View {
     private var validationSection: some View {
         VStack(alignment: .leading, spacing: Tokens.itemGap) {
             sectionTitle("3. Diagnóstico de segundo plano")
-            statusLine("Geofences: \(geofenceText)", severity: geofenceSummary == nil ? .warning : .ok)
+            statusLine("Geofences: \(geofenceText)", severity: geofenceSeverity)
             statusLine("Eventos do ensaio: \(validationEventCount)", severity: validationEventCount > 0 ? .ok : .warning)
             Text("Último evento: \(latestValidationEvent)")
                 .checkingText(CheckingTypography.bodySmall)
@@ -174,6 +189,13 @@ struct PhysicalValidationScreen: View {
                 Button("Encerrar ensaio") { Task { await stopPhysicalValidation() } }
                     .buttonStyle(ValidationSecondaryButtonStyle())
             }
+            Button(isPreparingDiagnosticsExport ? "Preparando diagnóstico…" : "Exportar diagnóstico") {
+                Task { await exportDiagnostics() }
+            }
+            .buttonStyle(ValidationSecondaryButtonStyle())
+            .disabled(isPreparingDiagnosticsExport || diagnosticsExport != nil)
+            .accessibilityLabel("Exportar diagnóstico de validação")
+            .accessibilityIdentifier("physical-validation-export-diagnostics")
 #endif
 
             if !operationMessage.isEmpty {
@@ -210,8 +232,16 @@ struct PhysicalValidationScreen: View {
     }
 
     private var geofenceText: String {
-        guard let summary = geofenceSummary else { return "ainda não registradas" }
-        return "\(summary.monitored) monitoradas, \(summary.omitted) omitidas"
+        if let snapshot = geofenceSnapshot {
+            return "\(snapshot.requestedCount) solicitadas, \(snapshot.confirmedCount) confirmadas, \(snapshot.failedCount) falhas, \(snapshot.omittedCount) omitidas, \(snapshot.pendingCount) pendentes"
+        }
+        guard let summary = geofenceSummary else { return "ainda não solicitadas" }
+        return "\(summary.requested) solicitadas, \(summary.omitted) omitidas"
+    }
+
+    private var geofenceSeverity: HealthSeverity {
+        guard let snapshot = geofenceSnapshot else { return .warning }
+        return snapshot.confirmationState == .confirmed ? .ok : .warning
     }
 
     private var nextPermissionButtonTitle: String {
@@ -309,9 +339,36 @@ struct PhysicalValidationScreen: View {
         await refreshDiagnostics()
     }
 
+#if DEBUG
+    private func exportDiagnostics() async {
+        guard !isPreparingDiagnosticsExport, diagnosticsExport == nil else { return }
+        isPreparingDiagnosticsExport = true
+        defer { isPreparingDiagnosticsExport = false }
+
+        let exporter = EvaluationDiagnosticsExporter(journal: environment.evaluationJournal)
+        guard let url = await exporter.createTemporaryExport() else {
+            operationMessage = "Não foi possível preparar o diagnóstico."
+            return
+        }
+        guard !Task.isCancelled else {
+            EvaluationDiagnosticsExporter.removeTemporaryExport(at: url)
+            return
+        }
+        diagnosticsExport = DiagnosticsExportFile(url: url)
+        operationMessage = "Diagnóstico preparado para compartilhamento."
+    }
+
+    private func removeDiagnosticsExport() {
+        guard let export = diagnosticsExport else { return }
+        diagnosticsExport = nil
+        EvaluationDiagnosticsExporter.removeTemporaryExport(at: export.url)
+    }
+#endif
+
     private func refreshDiagnostics() async {
         permissions = await environment.permissionsInspector.inspect()
         consentGranted = !(await environment.appPreferences.backgroundLocationConsentAt()).isEmpty
+        geofenceSnapshot = await environment.geofenceRegionManager.monitoringSnapshot()
         geofenceSummary = await environment.geofenceRegionManager.lastSummary
         evaluation = EvaluationLog.shared.snapshot().first
 #if DEBUG
@@ -383,6 +440,13 @@ struct PhysicalValidationScreen: View {
     }
 }
 
+#if DEBUG
+private struct DiagnosticsExportFile: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+#endif
+
 private extension View {
     func checkingValidationField() -> some View {
         self
@@ -420,3 +484,4 @@ private struct ValidationSecondaryButtonStyle: ButtonStyle {
             .clipShape(RoundedRectangle(cornerRadius: Tokens.controlRadius, style: .circular))
     }
 }
+#endif

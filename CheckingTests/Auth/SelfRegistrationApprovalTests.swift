@@ -40,6 +40,36 @@ final class SelfRegistrationApprovalTests: XCTestCase {
         h.teardown()
     }
 
+    func test_registration_key_is_draft_until_submit_then_adopted_once_without_probe() async {
+        let h = VMHarness()
+        h.auth.statusResults["NEW1"] = .success(status(found: false))
+        h.projects.result = .success([Project(id: 1, name: "PRJ", transportEnabled: false)])
+        h.auth.selfRegisterResult = .success(
+            status(found: false, pendingApproval: true, chave: "NEW2")
+        )
+        let vm = h.build()
+        await settle { !vm.uiState.isInitializing }
+        vm.onChaveChanged("NEW1")
+        await settle { vm.uiState.dialogOpen == .selfRegistration }
+
+        vm.onRegChaveChanged("NEW2")
+        XCTAssertEqual(vm.uiState.chave, "NEW1")
+        XCTAssertEqual(vm.uiState.selfRegistrationFields.chave, "NEW2")
+        XCTAssertEqual(h.auth.statusCalls, ["NEW1"])
+        let logoutBeforeSubmit = h.auth.logoutCallCount
+
+        await fillFormAndSubmit(vm)
+        await settle { vm.uiState.isAwaitingApproval }
+
+        let persistedChave = await h.prefs.chave()
+        XCTAssertEqual(vm.uiState.chave, "NEW2")
+        XCTAssertEqual(persistedChave, "NEW2")
+        XCTAssertEqual(h.auth.selfRegistrationCalls, ["NEW2"])
+        XCTAssertEqual(h.auth.statusCalls, ["NEW1"])
+        XCTAssertEqual(h.auth.logoutCallCount, logoutBeforeSubmit + 1)
+        h.teardown()
+    }
+
     func test_submit_queue_full_red_message_not_awaiting_not_authenticated() async {
         let h = VMHarness()
         h.auth.statusResults["NEW1"] = .success(status(found: false))

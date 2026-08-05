@@ -2,6 +2,18 @@ import XCTest
 @testable import Checking
 
 final class KeychainStoreTests: XCTestCase {
+    private func saveCurrentResponse(
+        _ store: any SessionCookieStore,
+        url: URL,
+        headerFields: [String: String]
+    ) {
+        let snapshot = store.requestSnapshot(for: url)
+        store.saveFromResponse(
+            url,
+            headerFields: headerFields,
+            requestGeneration: snapshot.generation)
+    }
+
     func test_password_roundTrip_survivesNewStoreInstance_andClearWipes() {
         let service = "br.com.tscode.checking.tests.passwords.\(UUID().uuidString)"
         let first = KeychainSecurePasswordStore(service: service)
@@ -32,13 +44,55 @@ final class KeychainStoreTests: XCTestCase {
         let first = KeychainSessionCookieStore(service: service, now: { 1_000 })
         defer { first.clear() }
 
-        first.saveFromResponse(url, headerFields: ["Set-Cookie": "session=test-value; Path=/; Secure; HttpOnly"])
+        saveCurrentResponse(
+            first,
+            url: url,
+            headerFields: ["Set-Cookie": "session=test-value; Path=/; Secure; HttpOnly"])
         XCTAssertEqual(first.cookieHeader(for: url), "session=test-value")
 
         let reopened = KeychainSessionCookieStore(service: service, now: { 1_000 })
         XCTAssertEqual(reopened.cookieHeader(for: url), "session=test-value")
         reopened.clear()
         XCTAssertNil(first.cookieHeader(for: url))
+    }
+
+    func test_cookieResponseFromGenerationBeforeClearIsRejected() {
+        let service = "br.com.tscode.checking.tests.cookie-generation.\(UUID().uuidString)"
+        let url = URL(string: "https://example.invalid/api")!
+        let store = KeychainSessionCookieStore(service: service, now: { 1_000 })
+        defer { store.clear() }
+
+        let staleSnapshot = store.requestSnapshot(for: url)
+        store.clear()
+        store.saveFromResponse(
+            url,
+            headerFields: ["Set-Cookie": "session=stale-keychain-response; Path=/"],
+            requestGeneration: staleSnapshot.generation)
+
+        XCTAssertNil(store.cookieHeader(for: url))
+    }
+
+    func test_cookieInvalidationPreservesCurrentCookieAndRejectsOldResponse() {
+        let service = "br.com.tscode.checking.tests.cookie-invalidation.\(UUID().uuidString)"
+        let url = URL(string: "https://example.invalid/api")!
+        let store = KeychainSessionCookieStore(service: service, now: { 1_000 })
+        defer { store.clear() }
+        saveCurrentResponse(
+            store,
+            url: url,
+            headerFields: ["Set-Cookie": "session=current-keychain-session; Path=/"])
+        let staleSnapshot = store.requestSnapshot(for: url)
+
+        store.invalidateInFlightResponses()
+        let currentSnapshot = store.requestSnapshot(for: url)
+        store.saveFromResponse(
+            url,
+            headerFields: ["Set-Cookie": "session=stale-keychain-response; Path=/"],
+            requestGeneration: staleSnapshot.generation)
+
+        XCTAssertNotEqual(staleSnapshot.generation, currentSnapshot.generation)
+        XCTAssertEqual(currentSnapshot.cookieHeader, "session=current-keychain-session")
+        XCTAssertEqual(store.cookieHeader(for: url), "session=current-keychain-session")
     }
 
     func test_offlineQueueRoundTrip_isDurableEncrypted_andClearWipesKeyAndPayload() {

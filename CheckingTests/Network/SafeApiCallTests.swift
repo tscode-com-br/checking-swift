@@ -28,6 +28,10 @@ final class SafeApiCallTests: XCTestCase {
         let r: AppResult<Int> = await safeApiCall { throw HTTPError(status: 422, body: nil) }
         XCTAssertEqual(r.error, .http(status: 422, detail: nil))
     }
+    func test_other_4xx_preserves_status_and_raw_detail() async {
+        let r: AppResult<Int> = await safeApiCall { throw HTTPError(status: 400, body: "bad-request") }
+        XCTAssertEqual(r.error, .http(status: 400, detail: "bad-request"))
+    }
     func test_urlerror_timeout_maps_network() async {
         let r: AppResult<Int> = await safeApiCall { throw URLError(.timedOut) }
         XCTAssertEqual(r.error, .network)

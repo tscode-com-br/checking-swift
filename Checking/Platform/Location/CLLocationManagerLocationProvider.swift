@@ -1,26 +1,114 @@
 import CoreLocation
 
-/// Implementação viva de `LocationProvider` — port de platform/location/LocationProvider.kt ("15s
-/// melhor-fix"). Ver port_spec_background_orchestrator §8. Cada chamada a `capture` cria sua própria
-/// `CaptureSession` (CLLocationManager + delegate próprios) — sem estado compartilhado entre chamadas
-/// concorrentes, fiel ao `callbackFlow` do Kotlin (que também isola callback/`bestRef` por invocação).
-/// `CaptureLocationUseCase` é o "único chokepoint (manual + automático)", então chamadas concorrentes
-/// (check-in manual + orquestrador em background) são um cenário real, não hipotético.
-///
-/// `capture`/`CaptureSession` são integração com o CoreLocation real — não cobertos por teste unitário
-/// (mesmo padrão de `NWPathMonitorNetworkMonitor`); a lógica que os consome (`CaptureLocationUseCase`,
-/// `RunAutomaticActivitiesUseCase`) já é testada com um `LocationProvider` fake. Só `isBetter`/
-/// `isValidAccuracy` (puros) são testados diretamente aqui.
+enum LocationUpdateAuthorization: Sendable, Equatable {
+    case allowed
+    case permissionDenied
+    case unavailable
+}
+
+enum LocationUpdateFailure: Sendable, Equatable {
+    case permissionDenied
+    case unavailable
+    case locationUnknown
+    case other
+}
+
+enum CoreLocationFailureSignal: Sendable, Equatable {
+    case denied
+    case locationUnknown
+    case other
+}
+
+enum CoreLocationErrorClassifier {
+    static func classify(_ error: Error) -> CoreLocationFailureSignal {
+        let nsError = error as NSError
+        guard nsError.domain == kCLErrorDomain,
+              let code = CLError.Code(rawValue: nsError.code) else {
+            return .other
+        }
+
+        switch code {
+        case .denied:
+            return .denied
+        case .locationUnknown:
+            return .locationUnknown
+        default:
+            return .other
+        }
+    }
+}
+
+/// Adapter mínimo: o `CLLocationManager` concreto nunca cruza o `MainActor`.
+@MainActor
+protocol LocationUpdateDriving: AnyObject {
+    var authorization: LocationUpdateAuthorization { get }
+
+    func start(
+        onLocations: @escaping @MainActor @Sendable ([LocationSample]) -> Void,
+        onFailure: @escaping @MainActor @Sendable (LocationUpdateFailure) -> Void
+    )
+    func stop()
+}
+
+@MainActor
+protocol CaptureTimeoutCancellable: AnyObject {
+    func cancel()
+}
+
+@MainActor
+protocol CaptureTimeoutScheduling: AnyObject {
+    func schedule(
+        after delay: TimeInterval,
+        operation: @escaping @MainActor @Sendable () -> Void
+    ) -> any CaptureTimeoutCancellable
+}
+
+/// Implementação viva do contrato de captura de 15 segundos. O perfil escolhe um único caminho:
+/// legado (sem seed/frescor) ou candidato (seed e política de 10 s/2 s); ambos compartilham somente
+/// infraestrutura segura e nunca executam duas sessões para comparar resultados.
 struct CLLocationManagerLocationProvider: LocationProvider {
     static let timeBudgetSeconds: TimeInterval = 15
 
-    func capture(_ accuracyThresholdMeters: Int) async -> LocationCapture {
-        await CaptureSession(accuracyThresholdMeters: accuracyThresholdMeters).run()
+    let behavior: LocationCaptureBehavior
+    private let samplePolicy: LocationSamplePolicy
+    private let now: @Sendable () -> Date
+    private let makeDriver: @MainActor @Sendable () -> any LocationUpdateDriving
+    private let makeTimeoutScheduler: @MainActor @Sendable () -> any CaptureTimeoutScheduling
+
+    init(
+        behavior: LocationCaptureBehavior = .legacyCompatible,
+        samplePolicy: LocationSamplePolicy = .candidateTrial,
+        now: @escaping @Sendable () -> Date = { Date() },
+        makeDriver: @escaping @MainActor @Sendable () -> any LocationUpdateDriving = {
+            CoreLocationUpdateDriver()
+        },
+        makeTimeoutScheduler: @escaping @MainActor @Sendable () -> any CaptureTimeoutScheduling = {
+            TaskCaptureTimeoutScheduler()
+        }
+    ) {
+        self.behavior = behavior
+        self.samplePolicy = samplePolicy
+        self.now = now
+        self.makeDriver = makeDriver
+        self.makeTimeoutScheduler = makeTimeoutScheduler
     }
 
-    /// `menor horizontalAccuracy` vence; empate → `timestamp` mais novo (port de `isBetter` do Kotlin).
-    /// Accuracy negativa também é tratada como inválida — convenção do CoreLocation (não existe no Android,
-    /// onde accuracy nunca é negativa), extensão natural do guard `isFinite()` original do Kotlin.
+    func capture(
+        _ accuracyThresholdMeters: Int,
+        seed: LocationSample?
+    ) async -> LocationCapture {
+        await CaptureSession(
+            behavior: behavior,
+            accuracyThresholdMeters: accuracyThresholdMeters,
+            seed: seed,
+            samplePolicy: samplePolicy,
+            now: now,
+            makeDriver: makeDriver,
+            makeTimeoutScheduler: makeTimeoutScheduler
+        ).run()
+    }
+
+    /// Compatibilidade da regra pura original usada por testes e pelo caminho legado.
     static func isBetter(_ candidate: CLLocation, than current: CLLocation?) -> Bool {
         guard let current else { return true }
         if !isValidAccuracy(candidate.horizontalAccuracy) { return false }
@@ -35,89 +123,301 @@ struct CLLocationManagerLocationProvider: LocationProvider {
     }
 }
 
-/// Sessão de captura única (uma por chamada a `capture`) — dona do `CLLocationManager`/delegate/timeout,
-/// resolve a `CheckedContinuation` exatamente 1×. `@MainActor`: CLLocationManager precisa de run loop ativo
-/// (a thread principal garante isso); os callbacks do delegate chegam nela.
+/// Sessão única e testável. Continuation, timer e driver são consumidos no primeiro terminal.
 @MainActor
-private final class CaptureSession: NSObject, CLLocationManagerDelegate {
-    private let manager = CLLocationManager()
+private final class CaptureSession {
+    private let behavior: LocationCaptureBehavior
     private let accuracyThresholdMeters: Int
-    private var best: CLLocation?
-    private var continuation: CheckedContinuation<LocationCapture, Never>?
-    private var timeoutTask: Task<Void, Never>?
+    private let seed: LocationSample?
+    private let samplePolicy: LocationSamplePolicy
+    private let now: @Sendable () -> Date
+    private let makeDriver: @MainActor @Sendable () -> any LocationUpdateDriving
+    private let makeTimeoutScheduler: @MainActor @Sendable () -> any CaptureTimeoutScheduling
 
-    init(accuracyThresholdMeters: Int) {
+    private var state: CaptureSessionState?
+    private var driver: (any LocationUpdateDriving)?
+    private var timeoutToken: (any CaptureTimeoutCancellable)?
+    private var continuation: CheckedContinuation<LocationCapture, Never>?
+    private var driverStarted = false
+    private var cancellationRequested = false
+
+    init(
+        behavior: LocationCaptureBehavior,
+        accuracyThresholdMeters: Int,
+        seed: LocationSample?,
+        samplePolicy: LocationSamplePolicy,
+        now: @escaping @Sendable () -> Date,
+        makeDriver: @escaping @MainActor @Sendable () -> any LocationUpdateDriving,
+        makeTimeoutScheduler: @escaping @MainActor @Sendable () -> any CaptureTimeoutScheduling
+    ) {
+        self.behavior = behavior
         self.accuracyThresholdMeters = accuracyThresholdMeters
-        super.init()
+        self.seed = seed
+        self.samplePolicy = samplePolicy
+        self.now = now
+        self.makeDriver = makeDriver
+        self.makeTimeoutScheduler = makeTimeoutScheduler
     }
 
     func run() async -> LocationCapture {
-        // Fiel ao Kotlin: sem permissão do APP é falha RÁPIDA (`SecurityException` síncrona lá), não
-        // espera os 15s. Pedir a permissão em si é da escada (port_spec_permissions_diagnostics), não daqui.
-        // Deliberadamente SEM checar `CLLocationManager.locationServicesEnabled()` aqui: no Android, o
-        // toggle de Localização do sistema desligado não lança (só a permissão do app lança) — o
-        // `requestLocationUpdates` some silenciosamente e o capture só resolve no timeout de 15s
-        // (`Timeout`, não `Unavailable`). Um guard prévio aqui reproduziria errado esse caso. Nota: o
-        // CoreLocation pode ainda reportar isso via `didFailWithError(.denied)` reativamente (§ abaixo) —
-        // o iOS não separa "serviço desligado" de "permissão negada" no nível do delegate como o Android
-        // separa a exceção; temos que documentar a divergência residual, não fingir que não existe.
-        switch manager.authorizationStatus {
-        case .authorizedWhenInUse, .authorizedAlways: break
-        default: return .unavailable
+        await withTaskCancellationHandler {
+            await runProtected()
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.requestCancellation()
+            }
         }
+    }
+
+    private func runProtected() async -> LocationCapture {
+        guard !Task.isCancelled, !cancellationRequested else {
+            return .failure(.cancelled(.taskCancelled))
+        }
+
+        let captureStartedAt = now()
+        state = CaptureSessionState(
+            behavior: behavior,
+            accuracyThresholdMeters: accuracyThresholdMeters,
+            captureStartedAt: captureStartedAt,
+            samplePolicy: samplePolicy
+        )
+
+        let admission = updateState {
+            $0.admit(seed: seed, now: captureStartedAt)
+        }
+        if case .finish(let result) = admission {
+            return result
+        }
+
+        guard !Task.isCancelled, !cancellationRequested else {
+            return directCancellationResult()
+        }
+
+        let driver = makeDriver()
+        self.driver = driver
+        switch driver.authorization {
+        case .allowed:
+            break
+        case .permissionDenied:
+            return directFailureResult(.permissionDenied)
+        case .unavailable:
+            return directFailureResult(.unavailable)
+        }
+
+        guard !Task.isCancelled, !cancellationRequested else {
+            return directCancellationResult()
+        }
+
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            if Task.isCancelled || cancellationRequested {
+                apply(updateState { $0.cancel(.taskCancelled) })
+                return
+            }
+
+            timeoutToken = makeTimeoutScheduler().schedule(
+                after: CLLocationManagerLocationProvider.timeBudgetSeconds
+            ) { [weak self] in
+                guard let self else { return }
+                self.apply(self.updateState { $0.timeout(now: self.now()) })
+            }
+
+            driverStarted = true
+            driver.start(
+                onLocations: { [weak self] samples in
+                    guard let self else { return }
+                    self.apply(self.updateState { $0.receive(samples, now: self.now()) })
+                },
+                onFailure: { [weak self] failure in
+                    self?.receive(failure)
+                }
+            )
+        }
+    }
+
+    private func requestCancellation() {
+        cancellationRequested = true
+        guard state != nil else { return }
+        apply(updateState { $0.cancel(.taskCancelled) })
+    }
+
+    private func receive(_ failure: LocationUpdateFailure) {
+        let transition: CaptureSessionState.Transition
+        switch failure {
+        case .permissionDenied:
+            transition = updateState { $0.fail(.permissionDenied) }
+        case .unavailable:
+            transition = updateState { $0.fail(.unavailable) }
+        case .locationUnknown:
+            transition = updateState { $0.locationUnknown() }
+        case .other:
+            transition = updateState { $0.locationUnknown() }
+        }
+        apply(transition)
+    }
+
+    private func updateState(
+        _ mutation: (inout CaptureSessionState) -> CaptureSessionState.Transition
+    ) -> CaptureSessionState.Transition {
+        guard var state else { return .ignoredAfterFinish }
+        let transition = mutation(&state)
+        self.state = state
+        return transition
+    }
+
+    private func directCancellationResult() -> LocationCapture {
+        let transition = updateState { $0.cancel(.taskCancelled) }
+        if case .finish(let result) = transition { return result }
+        return .failure(.cancelled(.taskCancelled))
+    }
+
+    private func directFailureResult(_ failure: LocationAcquisitionFailure) -> LocationCapture {
+        let transition = updateState { $0.fail(failure) }
+        driver = nil
+        if case .finish(let result) = transition { return result }
+        return .failure(failure)
+    }
+
+    private func apply(_ transition: CaptureSessionState.Transition) {
+        guard case .finish(let result) = transition,
+              let continuation else { return }
+
+        self.continuation = nil
+        timeoutToken?.cancel()
+        timeoutToken = nil
+        if driverStarted {
+            driverStarted = false
+            driver?.stop()
+        }
+        driver = nil
+        continuation.resume(returning: result)
+    }
+}
+
+/// Único owner do objeto Core Location real. Coordenadas são convertidas para o tipo de domínio antes de
+/// saírem do `MainActor`; erros externos são reduzidos a uma whitelist tipada.
+@MainActor
+private final class CoreLocationUpdateDriver: NSObject, LocationUpdateDriving, CLLocationManagerDelegate {
+    private let manager: CLLocationManager
+    private var onLocations: (@MainActor @Sendable ([LocationSample]) -> Void)?
+    private var onFailure: (@MainActor @Sendable (LocationUpdateFailure) -> Void)?
+
+    override init() {
+        manager = CLLocationManager()
+        super.init()
+    }
+
+    var authorization: LocationUpdateAuthorization {
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse:
+            .allowed
+        case .denied, .restricted:
+            .permissionDenied
+        case .notDetermined:
+            .unavailable
+        @unknown default:
+            .unavailable
+        }
+    }
+
+    func start(
+        onLocations: @escaping @MainActor @Sendable ([LocationSample]) -> Void,
+        onFailure: @escaping @MainActor @Sendable (LocationUpdateFailure) -> Void
+    ) {
+        self.onLocations = onLocations
+        self.onFailure = onFailure
         manager.desiredAccuracy = kCLLocationAccuracyBest
         manager.delegate = self
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                self.continuation = continuation
-                // Já cancelado antes de sequer começar (ex.: BGTask expirou entre o gate acima e aqui).
-                if Task.isCancelled { finish(timedOut: true); return }
-                manager.startUpdatingLocation()
-                timeoutTask = Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: UInt64(CLLocationManagerLocationProvider.timeBudgetSeconds * 1_000_000_000))
-                    guard !Task.isCancelled else { return }
-                    self?.finish(timedOut: true)
-                }
-            }
-        } onCancel: {
-            // Cancelamento externo (ex.: `expirationHandler` do BGTask) — devolve melhor-fix-parcial se
-            // houver, senão `.timeout`. Sem isso, uma captura em voo ignoraria o cancelamento e rodaria
-            // até seus próprios 15s, atrapalhando o prazo que o próprio app deu ao BGTask.
-            Task { @MainActor [weak self] in self?.finish(timedOut: true) }
-        }
+        manager.startUpdatingLocation()
     }
 
-    private func finish(timedOut: Bool) {
-        guard let continuation else { return }
-        self.continuation = nil
-        timeoutTask?.cancel(); timeoutTask = nil
+    func stop() {
         manager.stopUpdatingLocation()
-        if let best {
-            // Melhor-fix-parcial no timeout mesmo sem bater o threshold — mesma semântica do Kotlin.
-            continuation.resume(returning: .success(lat: best.coordinate.latitude, lon: best.coordinate.longitude,
-                                                     accuracyMeters: best.horizontalAccuracy))
-        } else {
-            continuation.resume(returning: timedOut ? .timeout : .unavailable)
+        manager.delegate = nil
+        onLocations = nil
+        onFailure = nil
+    }
+
+    nonisolated func locationManager(
+        _ manager: CLLocationManager,
+        didUpdateLocations locations: [CLLocation]
+    ) {
+        let samples = locations.map {
+            LocationSample(
+                latitude: $0.coordinate.latitude,
+                longitude: $0.coordinate.longitude,
+                horizontalAccuracyMeters: $0.horizontalAccuracy,
+                capturedAt: $0.timestamp,
+                source: .standardCapture
+            )
+        }
+        Task { @MainActor [weak self, samples] in
+            self?.onLocations?(samples)
         }
     }
 
-    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        Task { @MainActor [weak self] in
-            guard let self, let newest = locations.last else { return }
-            if CLLocationManagerLocationProvider.isBetter(newest, than: best) { best = newest }
-            if let best, CLLocationManagerLocationProvider.isValidAccuracy(best.horizontalAccuracy),
-               best.horizontalAccuracy <= Double(accuracyThresholdMeters) {
-                finish(timedOut: false)
+    nonisolated func locationManager(
+        _ manager: CLLocationManager,
+        didFailWithError error: Error
+    ) {
+        let signal = CoreLocationErrorClassifier.classify(error)
+
+        Task { @MainActor [weak self, signal] in
+            self?.receive(signal)
+        }
+    }
+
+    private func receive(_ signal: CoreLocationFailureSignal) {
+        let failure: LocationUpdateFailure
+        switch signal {
+        case .denied:
+            switch manager.authorizationStatus {
+            case .denied, .restricted:
+                failure = .permissionDenied
+            default:
+                failure = .unavailable
             }
+        case .locationUnknown:
+            failure = .locationUnknown
+        case .other:
+            failure = .other
+        }
+        onFailure?(failure)
+    }
+}
+
+@MainActor
+private final class TaskCaptureTimeoutScheduler: CaptureTimeoutScheduling {
+    func schedule(
+        after delay: TimeInterval,
+        operation: @escaping @MainActor @Sendable () -> Void
+    ) -> any CaptureTimeoutCancellable {
+        TaskCaptureTimeoutToken(delay: delay, operation: operation)
+    }
+}
+
+@MainActor
+private final class TaskCaptureTimeoutToken: CaptureTimeoutCancellable {
+    private var task: Task<Void, Never>?
+
+    init(
+        delay: TimeInterval,
+        operation: @escaping @MainActor @Sendable () -> Void
+    ) {
+        let safeDelay = delay.isFinite ? max(0, delay) : 0
+        task = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(safeDelay))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            operation()
         }
     }
 
-    // Erros transitórios (ex.: `.locationUnknown`, sinal momentaneamente indisponível) são ignorados — o
-    // CoreLocation segue tentando e o timeout/melhor-fix decide. Só `.denied` (permissão revogada em
-    // pleno voo) encerra cedo como `.unavailable` — sem equivalente 1:1 no Kotlin (API diferente), mas é a
-    // leitura mais fiel de "erro real" vs. "ainda não temos fix".
-    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        guard let clError = error as? CLError, clError.code == .denied else { return }
-        Task { @MainActor [weak self] in self?.finish(timedOut: false) }
+    func cancel() {
+        task?.cancel()
+        task = nil
     }
 }

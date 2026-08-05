@@ -76,5 +76,7 @@
 	<string>$(CHECKING_X_CLIENT)</string>
 	<key>CHECKINGApnsEnv</key>
 	<string>$(CHECKING_APNS_ENV)</string>
+	<key>CHECKINGBackgroundReliabilityProfile</key>
+	<string>$(CHECKING_BACKGROUND_RELIABILITY_PROFILE)</string>
 </dict>
 </plist>

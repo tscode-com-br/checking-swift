@@ -6,6 +6,7 @@ struct RootView: View {
     @Environment(\.appEnvironment) private var env
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var systemDynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showSplash = true
     @State private var checkViewModel: CheckViewModel?
     @State private var accidentViewModel: AccidentViewModel?
@@ -34,6 +35,34 @@ struct RootView: View {
         // cartões permaneçam brancos.
         .preferredColorScheme(.light)
         .animation(effectiveReduceMotion ? nil : .easeInOut(duration: 0.25), value: showSplash)
+        .task(id: lifecycleTaskID) {
+            guard !Task.isCancelled else { return }
+            let applicationState = evaluationApplicationState
+            let revision =
+                await env.evaluationApplicationStateStore.reserveUpdateRevision()
+            guard !Task.isCancelled else { return }
+            let accepted = await env.evaluationApplicationStateStore.update(
+                applicationState,
+                revision: revision
+            )
+            guard accepted, !Task.isCancelled else { return }
+            guard env.backgroundReliabilityProfile.uiLifecycleBehavior == .headlessGuarded,
+                  let checkViewModel else { return }
+            await checkViewModel.sceneStateDidChange(applicationState)
+        }
+    }
+
+    private var lifecycleTaskID: String {
+        "\(evaluationApplicationState.rawValue):\(checkViewModel == nil ? "waiting" : "ready")"
+    }
+
+    private var evaluationApplicationState: EvaluationApplicationState {
+        switch scenePhase {
+        case .active: .active
+        case .inactive: .inactive
+        case .background: .background
+        @unknown default: .unknown
+        }
     }
 
     private var effectiveDynamicTypeSize: DynamicTypeSize {
@@ -232,6 +261,7 @@ struct RootView: View {
             appPreferences: env.appPreferences,
             securePasswordStore: env.securePasswordStore,
             authRepository: env.authRepository,
+            authSessionCoordinator: env.authSessionCoordinator,
             projectRepository: env.projectRepository,
             checkRepository: env.checkRepository,
             captureLocationUseCase: env.captureLocationUseCase,
@@ -242,8 +272,10 @@ struct RootView: View {
             checkEventStream: env.checkEventStream,
             activityLogger: env.activityLogger,
             clock: env.clock,
+            evaluationJournal: env.evaluationJournal,
             activityLog: env.activityLog,
             geofenceRegionManager: env.geofenceRegionManager,
+            backgroundReliabilityProfile: env.backgroundReliabilityProfile,
             initialState: initialState,
             initialLanguageCode: initialLanguageCode)
     }

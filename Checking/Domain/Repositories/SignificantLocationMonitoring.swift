@@ -1,5 +1,9 @@
 import Foundation
 
+/// Payload opcional de um wake por mudança significativa. `nil` ainda representa um wake válido quando
+/// o Core Location não entregou uma amostra íntegra e fresca que possa servir como seed.
+typealias SignificantLocationWakeHandler = @Sendable (LocationSample?) -> Void
+
 /// Seam do fallback de movimento amplo do iOS (plano §9.3). A implementação viva usa
 /// `startMonitoringSignificantLocationChanges`; o evento apenas acorda o orquestrador, que continua sendo
 /// a fonte única para gates, captura precisa, matching e matriz de atividades.

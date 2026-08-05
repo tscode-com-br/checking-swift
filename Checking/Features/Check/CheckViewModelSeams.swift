@@ -14,11 +14,17 @@ protocol ProjectListing: Sendable {
 
 /// Dispara o orquestrador (narrow seam para o `onForegroundResume`).
 protocol OrchestratorRunning: Sendable {
-    func runOnce(_ trigger: OrchestratorTrigger) async
+    @discardableResult
+    func runOnce(_ trigger: OrchestratorTrigger) async -> EvaluationCompletion
     /// Cancela o episódio/retry de baixa precisão e invalida resultados automáticos ainda em voo.
     func invalidateAccuracyRetry() async
     /// Troca de chave/projeto/toggle invalida todos os trabalhos ligados ao contexto anterior.
     func invalidateAutomationContext() async
+    /// Mantém o barrier aberto enquanto o caller persiste/limpa o novo contexto.
+    func beginAutomationContextTransition() async -> AutomationContextTransitionToken
+    /// Wipe/delete aguardam o terminal da avaliação antiga antes de apagar journal/fila.
+    func awaitAutomationQuiescence(_ token: AutomationContextTransitionToken) async
+    func endAutomationContextTransition(_ token: AutomationContextTransitionToken) async
     /// Edição da configuração invalida somente um adiamento ainda não ativado e reconcilia a pausa.
     func scheduledPauseSettingsDidChange() async
     /// Um submit aceito só é confirmado pelo `HistoryState` devolvido pelo servidor.
@@ -36,6 +42,12 @@ extension OrchestratorRunning {
     func invalidateAutomationContext() async {
         await invalidateAccuracyRetry()
     }
+    func beginAutomationContextTransition() async -> AutomationContextTransitionToken {
+        await invalidateAutomationContext()
+        return AutomationContextTransitionToken()
+    }
+    func awaitAutomationQuiescence(_ token: AutomationContextTransitionToken) async {}
+    func endAutomationContextTransition(_ token: AutomationContextTransitionToken) async {}
     func scheduledPauseSettingsDidChange() async {
         await runOnce(.foreground)
     }

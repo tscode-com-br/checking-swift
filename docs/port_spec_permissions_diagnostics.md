@@ -10,6 +10,76 @@ Fontes: [PermissionLadder.kt](../../kotlin/app/src/main/java/br/com/tscode/check
 
 ---
 
+## 0. Estado efetivo de permissões e diagnóstico — atualização de 2026-08-04
+
+> **Regra de leitura.** As seções seguintes preservam o baseline Android e os slices históricos. Em conflito,
+> este contrato atual prevalece. O perfil `candidate` só foi exercitado por injeção local; `Debug`, `Staging`
+> e `Release` continuam em `legacyWithDiagnostics`. Não há telemetria remota, promoção de perfil ou prova
+> física do candidato implícita nesta documentação.
+
+### D5 e eligibility observacional
+
+D5 não mudou: `minimumToStartGranted` continua sendo notificações + localização precisa. A nova
+`BackgroundLocationEligibility` não substitui `PermissionLadder`, não pede permissões, não lê estado global e
+não liga/desliga registros de região ou significant-change. É uma classificação pura, sem chave, projeto ou
+coordenada, que expõe:
+
+| Estado | Pré-condições | Avalia em foreground | Prontidão nativa |
+|---|---|---:|---|
+| `blocked` | falha de contexto, toggle, projeto, consentimento, serviços, autorização ou precisão | não | `notReady` |
+| `foregroundOnly` | gates válidos + `When In Use` + precisão exata | sim | `notReady` |
+| `operational` | gates válidos + `Always` + precisão exata | sim | `readyForCoreLocation` |
+
+Background App Refresh é um sinal independente do timer (`available`, `degradedDenied` ou
+`degradedRestricted`); ele não manda parar regiões. Low Power é aviso, não bloqueio novo. Nenhum desses
+sinais promete wake, periodicidade, entrega pelo sistema ou recuperação após force-quit. A política foi
+coberta por 1.536 combinações puras, mas ainda é observacional: aplicar start/stop é condicional a uma fase e
+decisão posteriores.
+
+### Journal técnico privado
+
+Além do `EvaluationLog` legado, existe `DurableEvaluationJournal` v1, ator separado do ActivityLog/Core Data,
+em `Application Support/BackgroundReliability/evaluation-journal-v1.json`. O arquivo usa escrita atômica,
+proteção `completeUntilFirstUserAuthentication`, retenção de no máximo 500 records ou 30 dias e limite de
+2 MiB. `begin`/`advance`/`coalesce`/`finish` são monotônicos/exatamente uma vez. Registros iniciados por outro
+processo tornam-se `abandoned`; corrupção, schema desconhecido ou arquivo oversized são isolados, e arquivo
+protegido/indisponível é preservado para retry seguro em vez de ser apagado por reflexo.
+
+A allowlist comporta apenas enums fechados de trigger/estágio/terminal, buckets de precisão/idade/duração,
+timestamp local, flags de monitor/cena/launch, contagens de wake/owner e classes sanitizadas de HTTP/CLError.
+Ela proíbe coordenada, altitude, velocidade, local, projeto, usuário, chave, senha, cookie, token, body,
+header, URL, `clientEventId`, `eventTime`, identifier/token de região e erro cru. `LocationSample` não é
+serializável pelo journal. Os paths novos não usam `String(describing:)` nem `localizedDescription` para
+diagnóstico.
+
+O snapshot técnico de geofence contém somente geração e contagens `requested`, `confirmed`, `failed`/códigos
+em whitelist, `omitted`, `pending`, `confirmationUncertain` e `inheritedUnknown`; nenhum ID físico/lógico,
+token, local ou coordenada. A mensagem humana existente `Geofences registered (N).` continua byte-exact e
+representa somente `requested`. Não houve aprovação para acrescentar mensagens humanas/localizadas por
+callback; detalhes ficam no journal e na validação DEBUG.
+
+### Retenção, wipe e exportação
+
+`clear()` do journal/recorder é idempotente e tolera arquivo ausente/protegido. Wipe local primeiro invalida
+e leva a automação à quiescência, depois limpa journal, recorder DEBUG, ActivityLog, EvaluationLog,
+credenciais, preferências e a fila offline existente. Delete remoto repete a limpeza **somente depois** de
+sucesso aceito; falha ou 409 preserva sessão e dados. Não há regra nova para remover um evento da fila por
+uma resposta de submit indeterminada.
+
+A decisão vigente de exportação é **DEBUG-only**: `PhysicalValidationScreen` oferece gesto explícito para um
+snapshot bounded de até 500 records do journal e 500 eventos do recorder. O JSON sanitizado é criado em
+diretório temporário controlado, com cleanup em conclusão/cancelamento do compartilhamento e ao sair da tela.
+Não há exportação em launch/background/harness, botão ou share sheet em Staging/Release, upload ou telemetria.
+Qualquer superfície de produção exige aprovação de produto, privacidade, localização e testes de
+acessibilidade separados. O journal local, por si, não motivou alteração de `PrivacyInfo.xcprivacy`.
+
+### Evidência e limite
+
+Os testes locais cobrem retenção, corrupção, arquivo protegido/ausente, orphan, wipe, export explícito,
+cleanup e sentinelas de privacidade. A regressão integrada mais recente teve 1.156 testes unitários Debug e
+28 UI; o harness do Simulator terminou com 47 eventos sanitizados. Isso não é ensaio físico candidato nem
+prova de BGTask, energia, localização em hardware ou entrega do SO.
+
 ## 1. A escada de autorização iOS (D5)
 
 O Android tem 5 passos; no iOS **3** sobrevivem e **2 colapsam**:
@@ -81,13 +151,14 @@ A tela de atividades automáticas mostra **separadamente** (verde/laranja/vermel
 - Localização habilitada no sistema; autorização **Durante o Uso / Sempre**; **precisão exata/reduzida**;
 - notificações autorizadas; **Atualização em 2º Plano** disponível (`UIApplication.backgroundRefreshStatus`); **Modo Pouca Energia**;
 - automático habilitado (servidor/local); **pausa ativa + próxima transição**;
-- **regiões monitoradas + quantidade omitida** (cap 20 — background spec);
+- snapshot técnico de regiões: `requested`/`confirmed`/`failed`/`omitted`/`pending`/uncertain (contagens,
+  sem IDs), além da mensagem humana histórica de requested;
 - horário + resultado da última avaliação (`EvaluationLog`); **fila offline pendente**;
 - necessidade de **abrir Ajustes**.
 
 > **NUNCA** haverá instrução sobre "autostart" ou "ignorar otimização de bateria" — esses controles Android **não existem** no iOS (plano §12.3). O painel deve refletir só o que o iOS oferece.
 
-## 5. `EvaluationLog` — ring buffer volátil de diagnóstico
+## 5. `EvaluationLog` — ring buffer volátil legado
 
 ```swift
 enum EvaluationOutcome { case submitted, noAction, skip, paused, networkError, toggleOff }
@@ -102,7 +173,9 @@ actor EvaluationLog {                    // @Synchronized → actor-isolado (thr
     var isEmpty: Bool { ring.isEmpty }
 }
 ```
-- **Volátil por design** (MAX=50, perdido na morte do processo). ⚠️ **No iOS o processo é relançado a cada acordar de background** — se o painel precisar sobreviver ao relançamento, **adicionar persistência** (o Android é explicitamente volátil; decidir no port). Tornar **thread-safe** (actor).
+- **Volátil por design** (MAX=50, perdido na morte do processo) e thread-safe. Ele continua como buffer
+  legado de UI; persistência técnica de avaliação é responsabilidade separada do `DurableEvaluationJournal`
+  descrito em §0, não uma alteração deste buffer.
 - `EvaluationOutcome`: `submitted`/`noAction`/`skip`/`paused`/`networkError`/`toggleOff` — gravado pelo orquestrador em cada run (background spec §2).
 
 ## 6. Canais de notificação → categorias iOS
@@ -128,7 +201,7 @@ Android cria 2 canais (`CheckingApp.createNotificationChannels`): `auto_activiti
 - **`inspect` mapping**: fullAccuracy→`precise`, reducedAccuracy→`imprecise`, negado→`denied`; cameraMic; lowPowerMode; sem linha de autostart.
 - **`EvaluationLog`**: ring cap 50 (o 51º empurra o mais antigo); `snapshot` newest-first; `isEmpty`. (Nos testes, resetar por teste — é singleton global.)
 
-## 10. Checklist de fidelidade
+## 10. Checklist histórico de slices iniciais
 - [x] **D5**: gate = notificações + localização precisa (When In Use fullAccuracy); "Always"/Low Power recomendados, não bloqueiam. (`PermissionLadderStatus.minimumToStartGranted`, `AutomationHealthLevel` — §12)
 - [x] Escada iOS de 3 passos (notif, precisa, always); **remover** bateria e OEM autostart (e seus deep-links/alias). (§12)
 - [x] `nextStep` na ordem; launchers → só `openSettingsURLString` (`UIKitSettingsOpener`); background exige ir a Ajustes.

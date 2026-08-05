@@ -13,7 +13,9 @@ struct CheckMainScreen: View {
     let onNavigateToPrivacy: () -> Void
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL
+#if DEBUG || PHYSICAL_VALIDATION
     @State private var showPhysicalValidation = false
+#endif
     @State private var permissionRequester = PermissionRequestCoordinator()
 
     var body: some View {
@@ -119,12 +121,14 @@ struct CheckMainScreen: View {
         }
         .onAppear {
             permissionRequester.onAuthorizationChange = viewModel.finishPermissionReview
-            viewModel.onForegroundResume()
+            if !viewModel.usesHeadlessLifecycleGuard {
+                viewModel.onForegroundResume()
+            }
             synchronizeAccidentState()
         }
         .onChange(of: accidentCheckContext) { _, _ in synchronizeAccidentState() }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
+            if !viewModel.usesHeadlessLifecycleGuard, phase == .active {
                 viewModel.onForegroundResume()
                 viewModel.finishPermissionReview()
             }
@@ -136,6 +140,17 @@ struct CheckMainScreen: View {
         .fullScreenCover(isPresented: $showPhysicalValidation) {
             NavigationStack {
                 PhysicalValidationScreen(viewModel: viewModel, environment: environment)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button("Fechar") { showPhysicalValidation = false }
+                        }
+                }
+            }
+        }
+#elseif PHYSICAL_VALIDATION
+        .fullScreenCover(isPresented: $showPhysicalValidation) {
+            NavigationStack {
+                PhysicalValidationSnapshotScreen(environment: environment)
                     .toolbar {
                         ToolbarItem(placement: .topBarTrailing) {
                             Button("Fechar") { showPhysicalValidation = false }
@@ -290,8 +305,10 @@ struct CheckMainScreen: View {
                     viewModel.deleteAccount()
                 },
                 onPhysicalValidationTap: {
+#if DEBUG || PHYSICAL_VALIDATION
                     viewModel.dismissDialog()
                     showPhysicalValidation = true
+#endif
                 },
                 onDismiss: viewModel.dismissDialog)
         case .passwordChange:

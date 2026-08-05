@@ -40,31 +40,44 @@ final class PendingCheckReplayer: Sendable {
     }
 
     func drain() async -> DrainResult {
+        guard !Task.isCancelled else { return .retry }
         var pass = 0
         var finalAcceptedCheck: AcceptedCheck?
         while pass < Self.maxPasses {
+            guard !Task.isCancelled else { return .retry }
             let pending = await queue.peekAll()
+            guard !Task.isCancelled else { return .retry }
             if pending.isEmpty {
-                await notifyAcceptedCheck(finalAcceptedCheck)
+                guard await notifyAcceptedCheck(finalAcceptedCheck) else { return .retry }
                 return .completed
             }
             // Âncora da janela FORMS 24h = evento mais novo da fila (NÃO o relógio). Estável entre passes.
             let newest = pending.map(\.capturedAtEpochMs).max()!
+            guard !Task.isCancelled else { return .retry }
             logger.logSyncing(pending.count)
             for event in pending {
+                guard !Task.isCancelled else { return .retry }
                 let result = await replay(event, newest)
+                // `safeApiCall` reduz CancellationError a `.unknown`; este fence impede que essa perda de
+                // resposta seja confundida com falha permanente e remova o evento durável.
+                guard !Task.isCancelled else { return .retry }
                 if let accepted = result.acceptedCheck {
                     finalAcceptedCheck = accepted
                 }
                 switch result.outcome {
-                case .done, .drop: await queue.remove(event.clientEventId)
+                case .done, .drop:
+                    guard !Task.isCancelled else { return .retry }
+                    await queue.remove(event.clientEventId)
+                    guard !Task.isCancelled else { return .retry }
                 case .retry:       return .retry                     // aborta o drain INTEIRO; reagenda depois
                 }
             }
             pass += 1
         }
-        guard await queue.size() == 0 else { return .retry }
-        await notifyAcceptedCheck(finalAcceptedCheck)
+        guard !Task.isCancelled else { return .retry }
+        let remainingCount = await queue.size()
+        guard !Task.isCancelled, remainingCount == 0 else { return .retry }
+        guard await notifyAcceptedCheck(finalAcceptedCheck) else { return .retry }
         return .completed
     }
 
@@ -76,49 +89,92 @@ final class PendingCheckReplayer: Sendable {
     }
 
     private func replayDecided(_ e: PendingCheckEvent.Decided, _ newest: Int64) async -> ReplayResult {
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
         let action: CheckAction = e.action == "checkout" ? .checkOut : .checkIn
         let informe: InformeType = e.informe == "retroativo" ? .retroativo : .normal
         let result = await repository.submit(
             chave: e.chave, projeto: e.projeto, action: action, local: e.local, informe: informe,
             eventTime: Self.instant(e.capturedAtEpochMs), clientEventId: e.clientEventId,
             fillForms: fillFormsFor(e.capturedAtEpochMs, newest))
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
         let replay = replaySubmitResult(
             result,
             chave: e.chave,
             project: e.projeto,
             action: action)
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
         logReplayOutcome(replay.outcome, action, e.local)
         return replay
     }
 
     private func replayRaw(_ e: PendingCheckEvent.Raw, _ newest: Int64) async -> ReplayResult {
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
         let match: LocationMatch
-        switch await repository.matchLocation(e.latitude, e.longitude, e.accuracyMeters) {
+        let matchResult = await repository.matchLocation(
+            e.latitude,
+            e.longitude,
+            e.accuracyMeters
+        )
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
+        switch matchResult {
         case .success(let value): match = value
         case .failure(let error): return ReplayResult(outcome: failureOutcome(error), acceptedCheck: nil)
         }
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
         let state: HistoryState
-        switch await repository.getState(e.chave) {
+        let stateResult = await repository.getState(e.chave)
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
+        switch stateResult {
         case .success(let value): state = value
         case .failure(let error): return ReplayResult(outcome: failureOutcome(error), acceptedCheck: nil)
         }
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
         let options: LocationOptions
-        switch await repository.getLocations() {
+        let optionsResult = await repository.getLocations()
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
+        switch optionsResult {
         case .success(let value): options = value
         case .failure(let error): return ReplayResult(outcome: failureOutcome(error), acceptedCheck: nil)
         }
         guard let activity = resolveAutomaticActivityForMatch(match, state, options.mixedZoneIntervalMinutes) else {
             return ReplayResult(outcome: .done, acceptedCheck: nil) // sem ação → consome sem submit
         }
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
         let result = await repository.submit(
             chave: e.chave, projeto: e.projeto, action: activity.action, local: activity.local, informe: .normal,
             eventTime: Self.instant(e.capturedAtEpochMs), clientEventId: e.clientEventId,
             fillForms: fillFormsFor(e.capturedAtEpochMs, newest))
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
         let replay = replaySubmitResult(
             result,
             chave: e.chave,
             project: e.projeto,
             action: activity.action)
+        guard !Task.isCancelled else {
+            return ReplayResult(outcome: .retry, acceptedCheck: nil)
+        }
         logReplayOutcome(replay.outcome, activity.action, activity.local)
         return replay
     }
@@ -147,13 +203,15 @@ final class PendingCheckReplayer: Sendable {
         }
     }
 
-    private func notifyAcceptedCheck(_ accepted: AcceptedCheck?) async {
-        guard let accepted, let acceptedCheckObserver else { return }
+    private func notifyAcceptedCheck(_ accepted: AcceptedCheck?) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        guard let accepted, let acceptedCheckObserver else { return true }
         await acceptedCheckObserver.acceptedCheck(
             chave: accepted.chave,
             project: accepted.project,
             action: accepted.action,
             newState: accepted.state)
+        return !Task.isCancelled
     }
 
     // Transitório → RETRY (mantém): rede, sessão expirada, HTTP ≥500. Permanente → DROP (remove): 4xx, Conflict, Unknown.
@@ -166,6 +224,7 @@ final class PendingCheckReplayer: Sendable {
     }
 
     private func logReplayOutcome(_ outcome: Outcome, _ action: CheckAction, _ local: String?) {
+        guard !Task.isCancelled else { return }
         let kind: ActivityKind = action == .checkOut ? .checkOut : .checkIn
         switch outcome {
         case .done:  logger.logSynced(kind, local)

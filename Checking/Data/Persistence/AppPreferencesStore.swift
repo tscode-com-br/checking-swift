@@ -51,6 +51,19 @@ final class UserDefaultsPreferencesStore: AppPreferencesStore, @unchecked Sendab
     func setSeenAccidentIds(_ ids: Set<Int>) async {
         defaults.set(ids.map(String.init).joined(separator: ","), forKey: "pref_seen_accident_ids")
     }
+    func setSeenAccidentIdsIfCurrent(
+        _ ids: Set<Int>,
+        sessionGeneration: AuthSessionGeneration
+    ) async -> Bool {
+        // Lock order: session validity -> UserDefaults. Nenhum caminho inverso adquire a validity enquanto
+        // mantém um lock de preferências, e este trecho síncrono nunca suspende.
+        sessionGeneration.performIfCurrent {
+            defaults.set(
+                ids.map(String.init).joined(separator: ","),
+                forKey: "pref_seen_accident_ids"
+            )
+        }
+    }
     func getFlag(_ name: String) async -> Bool { defaults.bool(forKey: "pref_flag_\(name)") }
     func setFlag(_ name: String, _ value: Bool) async { defaults.set(value, forKey: "pref_flag_\(name)") }
     func accuracyRetryEpisodeJson() async -> String { string("pref_accuracy_retry_episode_json") }

@@ -105,12 +105,20 @@ else
   exit 6
 fi
 
-if command -v jq >/dev/null 2>&1 && jq -e '.events[] | select(.kind == "bg_task_registration" and .details.refreshSubmissionError == "none")' "$REPORT" >/dev/null && rg -q 'br\.com\.tscode\.checking\.refresh' "$REPORT"; then
+if command -v jq >/dev/null 2>&1 && jq -e '
+  .events[] | select(
+    .kind == "bg_task_registration" and .details.refreshSubmission == "scheduled"
+  )
+' "$REPORT" >/dev/null && jq -e '
+  .events[] | select(
+    .kind == "bg_task_pending_requests" and .details.hasRefresh == "true"
+  )
+' "$REPORT" >/dev/null; then
   echo "PASS: BGAppRefresh request is pending in BGTaskScheduler."
-elif command -v jq >/dev/null 2>&1 && jq -e '.events[] | select(.kind == "bg_task_registration" and (.details.refreshSubmissionError | contains("BGTaskSchedulerErrorDomain Code=1")))' "$REPORT" >/dev/null; then
-  echo "INCONCLUSIVE: this Simulator reports BGTaskSchedulerErrorCodeUnavailable (Code=1); task execution requires a physical iPhone."
+elif command -v jq >/dev/null 2>&1 && jq -e '.events[] | select(.kind == "bg_task_registration" and .details.refreshSubmission == "unavailable")' "$REPORT" >/dev/null; then
+  echo "INCONCLUSIVE: this Simulator reports BGAppRefresh unavailable; task execution requires a physical iPhone."
 else
-  echo "FAIL: BGAppRefresh request was neither scheduled nor rejected with the expected Simulator-unavailable error." >&2
+  echo "FAIL: BGAppRefresh request was neither scheduled nor classified as Simulator-unavailable." >&2
   exit 7
 fi
 

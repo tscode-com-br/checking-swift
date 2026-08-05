@@ -108,8 +108,9 @@ final class CLLocationManagerGeofenceMonitor: NSObject, GeofenceRegionMonitoring
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, monitoringDidFailFor region: CLRegion?, withError error: Error) {
-        let id = region?.identifier ?? "?"
-        Task { @MainActor [weak self] in self?.activityLogger.logWarning("Geofence monitoring failed for region \(id).") }
+        // O perfil legado não tem geração física para associar o callback com segurança, mas ainda não pode
+        // vazar o identifier ou o texto bruto do erro no ActivityLog. O candidato registra só código fechado.
+        Task { @MainActor [weak self] in self?.activityLogger.logWarning("Geofence monitoring failed.") }
     }
 
     private func handleTransition(entered: Bool, identifier: String) {
@@ -123,8 +124,7 @@ final class CLLocationManagerGeofenceMonitor: NSObject, GeofenceRegionMonitoring
         if BackgroundValidationHarness.isEnabled {
             Task {
                 await BackgroundValidationRecorder.shared.record(
-                    entered ? "production_geofence_enter" : "production_geofence_exit",
-                    details: ["region": identifier]
+                    entered ? "production_geofence_enter" : "production_geofence_exit"
                 )
             }
         }

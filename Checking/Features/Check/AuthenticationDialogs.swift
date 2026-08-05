@@ -347,7 +347,7 @@ struct SettingsDialog: View {
                 title: t("settings.activitiesLabel", lang: languageCode),
                 accessibilityIdentifier: "settings.activities",
                 action: onActivitiesTap)
-#if DEBUG
+#if DEBUG || PHYSICAL_VALIDATION
             if !ProcessInfo.processInfo.arguments.contains("--ui-test-documentation") {
                 settingsRow(
                     icon: "wrench.and.screwdriver",

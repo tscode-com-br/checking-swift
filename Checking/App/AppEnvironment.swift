@@ -5,6 +5,9 @@ import SwiftUI
 public struct AppEnvironment: Sendable {
     public let clock: any Clock
     public let apiConfig: ApiConfig
+    public let backgroundReliabilityProfile: BackgroundReliabilityProfile
+    let evaluationJournal: any EvaluationJournaling
+    let evaluationApplicationStateStore: EvaluationApplicationStateStore
     // Tipos internos (single-module) → a init é internal. Ver port_spec_network_contracts.
     let sessionCookieStore: any SessionCookieStore
     let checkRepository: any CheckRepository
@@ -14,7 +17,9 @@ public struct AppEnvironment: Sendable {
     let networkMonitor: any NetworkMonitoring     // NWPathMonitor (§ background)
     let checkEventStream: CheckEventStream        // SSE ao vivo compartilhado
     let offlineSyncCoordinator: OfflineSyncCoordinator  // drena a fila ao reconectar
+    let backgroundProcessingScheduler: BGTaskSyncScheduler // submit-only para o terminal do BGProcessing
     let authRepository: any AuthRepository        // login/status/self-register/delete (§ auth)
+    let authSessionCoordinator: any AuthSessionCoordinating // autoridade serial compartilhada UI/background
     let appPreferences: any AppPreferencesStore   // chave/settings/flags — fonte que o orquestrador lê
     let securePasswordStore: any SecurePasswordStore  // senha por-chave (Keychain real vem no slice de segurança)
     let accidentRepository: any AccidentRepository     // acidente+vídeo; também satisfaz o seam do orquestrador
@@ -34,11 +39,17 @@ public struct AppEnvironment: Sendable {
     //   tela SwiftUI do painel de integridade + fluxo de REQUISIÇÃO da escada (slice de UI — fidelidade ao
     //   AutoActivitiesDialog.kt); coletor async do HealthReport (assembla inspector+geofence+fila+prefs).
 
-    init(clock: any Clock, apiConfig: ApiConfig, sessionCookieStore: any SessionCookieStore,
+    init(clock: any Clock, apiConfig: ApiConfig, backgroundReliabilityProfile: BackgroundReliabilityProfile,
+         evaluationJournal: any EvaluationJournaling,
+         evaluationApplicationStateStore: EvaluationApplicationStateStore,
+         sessionCookieStore: any SessionCookieStore,
          checkRepository: any CheckRepository, offlineQueue: OfflineCheckQueue, activityLog: ActivityLog,
          activityLogger: ActivityLogger,
          networkMonitor: any NetworkMonitoring, checkEventStream: CheckEventStream,
-         offlineSyncCoordinator: OfflineSyncCoordinator, authRepository: any AuthRepository,
+         offlineSyncCoordinator: OfflineSyncCoordinator,
+         backgroundProcessingScheduler: BGTaskSyncScheduler,
+         authRepository: any AuthRepository,
+         authSessionCoordinator: any AuthSessionCoordinating,
          appPreferences: any AppPreferencesStore, securePasswordStore: any SecurePasswordStore,
          accidentRepository: any AccidentRepository, accidentVideoUploader: BackgroundAccidentVideoUploader? = nil,
          projectRepository: any ProjectRepository,
@@ -49,6 +60,9 @@ public struct AppEnvironment: Sendable {
          permissionsInspector: any PermissionsInspecting, settingsOpener: any SettingsOpening) {
         self.clock = clock
         self.apiConfig = apiConfig
+        self.backgroundReliabilityProfile = backgroundReliabilityProfile
+        self.evaluationJournal = evaluationJournal
+        self.evaluationApplicationStateStore = evaluationApplicationStateStore
         self.sessionCookieStore = sessionCookieStore
         self.checkRepository = checkRepository
         self.offlineQueue = offlineQueue
@@ -57,7 +71,9 @@ public struct AppEnvironment: Sendable {
         self.networkMonitor = networkMonitor
         self.checkEventStream = checkEventStream
         self.offlineSyncCoordinator = offlineSyncCoordinator
+        self.backgroundProcessingScheduler = backgroundProcessingScheduler
         self.authRepository = authRepository
+        self.authSessionCoordinator = authSessionCoordinator
         self.appPreferences = appPreferences
         self.securePasswordStore = securePasswordStore
         self.accidentRepository = accidentRepository
@@ -75,7 +91,20 @@ public struct AppEnvironment: Sendable {
     /// Composição viva do app em execução — monta a stack real (rede + persistência + gatilhos de background).
     @MainActor
     public static func live() -> AppEnvironment {
+        let backgroundReliabilityProfile = BackgroundReliabilityProfile.fromBundle()
         let clock = SystemClock()
+        let evaluationApplicationStateStore = EvaluationApplicationStateStore()
+        let evaluationJournal: any EvaluationJournaling
+        if let fileURL = DurableEvaluationJournal.liveFileURL() {
+            evaluationJournal = DurableEvaluationJournal(
+                fileURL: fileURL,
+                clock: clock,
+                processID: EvaluationProcessID()
+            )
+        } else {
+            AppLog.background.error("Evaluation journal disabled: Application Support unavailable.")
+            evaluationJournal = NoopEvaluationJournal()
+        }
         let apiConfig = ApiConfig.fromBundle()
         let cookieStore = KeychainSessionCookieStore()
         let http = URLSessionHTTPClient(baseURL: apiConfig.baseURL, xClient: apiConfig.xClient, cookieStore: cookieStore)
@@ -99,6 +128,10 @@ public struct AppEnvironment: Sendable {
         let authRepository = AuthRepositoryLive(api: authApi, checkRepository: checkRepository, cookieStore: cookieStore)
         let appPreferences = UserDefaultsPreferencesStore()
         let securePasswordStore = KeychainSecurePasswordStore()
+        let authSessionCoordinator = AuthSessionCoordinator(
+            authRepository: authRepository,
+            securePasswordStore: securePasswordStore,
+            cookieStore: cookieStore)
         // Acidente+vídeo: mesma stack HTTP + a MESMA conexão SSE compartilhada (/check/stream) do módulo Check.
         let accidentApi = AccidentApiLive(http: http)
         let accidentVideoUploader = BackgroundAccidentVideoUploader(
@@ -118,23 +151,33 @@ public struct AppEnvironment: Sendable {
         let notifications = AutoActivityNotificationsLive()
         let pauseAlarms = LocalNotificationPauseAlarmScheduler()
         let appRefreshScheduler = BGTaskAppRefreshScheduler()
-        let locationProvider = CLLocationManagerLocationProvider()
+        let locationProvider = CLLocationManagerLocationProvider(
+            behavior: backgroundReliabilityProfile.locationCaptureBehavior
+        )
         let captureLocationBase = CaptureLocationUseCase(
             locationProvider: locationProvider,
             checkRepository: checkRepository,
-            activityLogger: activityLogger)
+            activityLogger: activityLogger,
+            clock: clock,
+            captureBehavior: backgroundReliabilityProfile.locationCaptureBehavior)
         let captureLocation = CoalescingLocationCapture(base: captureLocationBase)
         let runAutomaticActivities = RunAutomaticActivitiesUseCase(captureLocationUseCase: captureLocation,
                                                                     checkRepository: checkRepository, offlineQueue: offlineQueue,
                                                                     clock: clock, activityLogger: activityLogger)
+        let backgroundTaskProtection = UIKitBackgroundTaskGuard()
         // Um prazo UIKit protege a conclusão de avaliações que começaram enquanto o app ainda estava ativo.
         // Ele não promete execução contínua e não substitui geofence/BGTask/APNs.
         let orchestrator = BackgroundCheckOrchestrator(
             appPrefs: appPreferences, checkRepository: checkRepository, runAutomaticActivities: runAutomaticActivities,
-            locationProvider: locationProvider, clock: clock, authRepository: authRepository,
-            securePasswordStore: securePasswordStore, accidentRepository: accidentRepository,
+            locationProvider: locationProvider, clock: clock,
+            authSessionCoordinator: authSessionCoordinator,
+            accidentRepository: accidentRepository,
             activityLogger: activityLogger, notifications: notifications,
-            backgroundTaskGuard: UIKitBackgroundTaskGuard(),
+            automaticEvaluationPipeline: backgroundReliabilityProfile.operationalPipeline,
+            applicationStateProvider: evaluationApplicationStateStore,
+            evaluationJournal: evaluationJournal,
+            backgroundTaskGuard: backgroundTaskProtection,
+            backgroundExecutionLeasing: backgroundTaskProtection,
             pauseAlarms: pauseAlarms,
             appRefreshScheduler: appRefreshScheduler)
         let replayer = PendingCheckReplayer(
@@ -146,12 +189,25 @@ public struct AppEnvironment: Sendable {
         syncScheduler.setDrainTrigger {
             [offlineSyncCoordinator] in Task { await offlineSyncCoordinator.triggerDrain() }
         }
-        // Geofence region-monitoring: o monitor real acorda o orquestrador (`runOnce(.geofence)`) em cada
-        // travessia; o manager busca/prioriza/arma (cap 20). Registro real dispara no foreground/login (Camada
-        // D) quando a UI existir — o gatilho já está pronto para plugar.
-        let geofenceMonitor = CLLocationManagerGeofenceMonitor(
-            activityLogger: activityLogger,
-            onGeofenceWake: { [orchestrator] in Task { await orchestrator.runOnce(.geofence) } })
+        // O perfil publicado mantém o handler legado. Só o candidato usa o adapter geracional, que troca
+        // IDs físicos opacos por geração e separa requested de confirmed; os dois nunca coexistem sobre o
+        // mesmo `CLLocationManager`/conjunto nativo.
+        let geofenceWake: @Sendable () -> Void = { [orchestrator] in
+            Task { _ = await orchestrator.evaluationTicket(.geofence) }
+        }
+        let geofenceMonitor: any GeofenceRegionMonitoring
+        switch backgroundReliabilityProfile.operationalPipeline {
+        case .legacy:
+            geofenceMonitor = CLLocationManagerGeofenceMonitor(
+                activityLogger: activityLogger,
+                onGeofenceWake: geofenceWake
+            )
+        case .candidate:
+            geofenceMonitor = GenerationAwareCLLocationManagerGeofenceMonitor(
+                activityLogger: activityLogger,
+                onGeofenceWake: geofenceWake
+            )
+        }
         let geofenceRegionManager = GeofenceRegionManager(
             checkRepository: checkRepository, monitor: geofenceMonitor, activityLogger: activityLogger)
         // Mudanças significativas: restaura imediatamente quando o usuário já consentiu e o automático está
@@ -160,14 +216,27 @@ public struct AppEnvironment: Sendable {
         let significantLocationMonitor = CLLocationManagerSignificantChangeMonitor(
             activityLogger: activityLogger,
             startsImmediately: appPreferences.shouldStartSignificantLocationMonitoringAtLaunch(),
-            onSignificantLocationWake: {
-                [orchestrator] in Task { await orchestrator.runOnce(.significantLocation) }
+            clock: clock,
+            onSignificantLocationWake: { [orchestrator] seedCandidate in
+                Task {
+                    _ = await orchestrator.evaluationTicket(
+                        .significantLocation,
+                        seedCandidate: seedCandidate
+                    )
+                }
             })
-        return AppEnvironment(clock: clock, apiConfig: apiConfig, sessionCookieStore: cookieStore,
+        return AppEnvironment(clock: clock, apiConfig: apiConfig,
+                              backgroundReliabilityProfile: backgroundReliabilityProfile,
+                              evaluationJournal: evaluationJournal,
+                              evaluationApplicationStateStore: evaluationApplicationStateStore,
+                              sessionCookieStore: cookieStore,
                               checkRepository: checkRepository, offlineQueue: offlineQueue, activityLog: activityLog,
                               activityLogger: activityLogger,
                               networkMonitor: networkMonitor, checkEventStream: checkEventStream,
-                              offlineSyncCoordinator: offlineSyncCoordinator, authRepository: authRepository,
+                              offlineSyncCoordinator: offlineSyncCoordinator,
+                              backgroundProcessingScheduler: syncScheduler,
+                              authRepository: authRepository,
+                              authSessionCoordinator: authSessionCoordinator,
                               appPreferences: appPreferences, securePasswordStore: securePasswordStore,
                               accidentRepository: accidentRepository, accidentVideoUploader: accidentVideoUploader,
                               projectRepository: projectRepository,
@@ -179,7 +248,12 @@ public struct AppEnvironment: Sendable {
     }
 
     /// Composição inerte para previews e testes (repositório stub, Core Data in-memory, sem rede/gatilhos).
-    public static let preview: AppEnvironment = {
+    public static let preview = makePreview()
+
+    static func makePreview(
+        backgroundReliabilityProfile: BackgroundReliabilityProfile = .legacyWithDiagnostics,
+        evaluationJournal: any EvaluationJournaling = NoopEvaluationJournal()
+    ) -> AppEnvironment {
         let cookieStore = InMemorySessionCookieStore()
         let checkRepository = PreviewCheckRepository()
         let offlineQueue = OfflineCheckQueue(store: InMemoryOfflineQueueStore(), scheduler: NoopSyncScheduler())
@@ -192,32 +266,52 @@ public struct AppEnvironment: Sendable {
         let previewAuthRepository = PreviewAuthRepository()
         let previewAccidentRepository = PreviewAccidentRepository()
         let previewClock = SystemClock()
+        let authSessionCoordinator = AuthSessionCoordinator(
+            authRepository: previewAuthRepository,
+            securePasswordStore: previewSecurePasswordStore,
+            cookieStore: cookieStore)
+        let evaluationApplicationStateStore = EvaluationApplicationStateStore()
         let locationProvider = UnavailableLocationProvider()
-        let captureLocation = CaptureLocationUseCase(locationProvider: locationProvider,
-                                                      checkRepository: checkRepository, activityLogger: activityLogger)
+        let captureLocation = CaptureLocationUseCase(
+            locationProvider: locationProvider,
+            checkRepository: checkRepository,
+            activityLogger: activityLogger,
+            clock: previewClock,
+            captureBehavior: backgroundReliabilityProfile.locationCaptureBehavior)
         let runAutomaticActivities = RunAutomaticActivitiesUseCase(captureLocationUseCase: captureLocation,
                                                                     checkRepository: checkRepository, offlineQueue: offlineQueue,
                                                                     clock: previewClock, activityLogger: activityLogger)
         let orchestrator = BackgroundCheckOrchestrator(
             appPrefs: previewPrefs, checkRepository: checkRepository, runAutomaticActivities: runAutomaticActivities,
-            locationProvider: locationProvider, clock: previewClock, authRepository: previewAuthRepository,
-            securePasswordStore: previewSecurePasswordStore, accidentRepository: previewAccidentRepository,
-            activityLogger: activityLogger, notifications: PreviewAutoActivityNotifications())
+            locationProvider: locationProvider, clock: previewClock,
+            authSessionCoordinator: authSessionCoordinator,
+            accidentRepository: previewAccidentRepository,
+            activityLogger: activityLogger, notifications: PreviewAutoActivityNotifications(),
+            automaticEvaluationPipeline: backgroundReliabilityProfile.operationalPipeline,
+            applicationStateProvider: evaluationApplicationStateStore,
+            evaluationJournal: evaluationJournal)
         let replayer = PendingCheckReplayer(
             queue: offlineQueue,
             repository: checkRepository,
             logger: activityLogger,
             acceptedCheckObserver: orchestrator)
+        let previewSyncScheduler = BGTaskSyncScheduler()
         let geofenceRegionManager = GeofenceRegionManager(
             checkRepository: checkRepository, monitor: NoopGeofenceRegionMonitor(), activityLogger: activityLogger)
         return AppEnvironment(
-            clock: previewClock, apiConfig: .preview, sessionCookieStore: cookieStore,
+            clock: previewClock, apiConfig: .preview,
+            backgroundReliabilityProfile: backgroundReliabilityProfile,
+            evaluationJournal: evaluationJournal,
+            evaluationApplicationStateStore: evaluationApplicationStateStore,
+            sessionCookieStore: cookieStore,
             checkRepository: checkRepository, offlineQueue: offlineQueue, activityLog: activityLog,
             activityLogger: activityLogger,
             networkMonitor: monitor,
             checkEventStream: CheckEventStream(makeStream: { _ in AsyncStream { $0.finish() } }),
             offlineSyncCoordinator: OfflineSyncCoordinator(replayer: replayer, monitor: monitor),
+            backgroundProcessingScheduler: previewSyncScheduler,
             authRepository: previewAuthRepository,
+            authSessionCoordinator: authSessionCoordinator,
             appPreferences: previewPrefs,
             securePasswordStore: previewSecurePasswordStore,
             accidentRepository: previewAccidentRepository,
@@ -227,7 +321,7 @@ public struct AppEnvironment: Sendable {
             geofenceRegionManager: geofenceRegionManager,
             significantLocationMonitor: NoopSignificantLocationMonitor(),
             permissionsInspector: PreviewPermissionsInspector(), settingsOpener: PreviewSettingsOpener())
-    }()
+    }
 }
 
 /// Config do backend lida do Info.plist (populado pelos .xcconfig). Ver port_spec_network_contracts §1.

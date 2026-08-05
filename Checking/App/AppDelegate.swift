@@ -2,6 +2,21 @@ import UIKit
 import BackgroundTasks
 import UserNotifications
 
+/// Mantém `BGTask` confinado ao `AppDelegate`; a seleção candidato/legado é exercitável sem instanciar
+/// uma task do framework em testes. O adapter não retém estado de execução nem altera completion.
+@MainActor
+private final class UIKitSystemBackgroundTaskAdapter: SystemBackgroundTaskHandling {
+    private let task: BGTask
+
+    init(task: BGTask) {
+        self.task = task
+    }
+
+    func installExpirationHandler(_ handler: @escaping @Sendable () -> Void) {
+        task.expirationHandler = { handler() }
+    }
+}
+
 /// Ponte UIKit para APNs + registro de BackgroundTasks (os identificadores devem ser registrados
 /// ANTES do fim do launch). Ver port_spec_background_orchestrator §9 (Camadas E/F) e
 /// port_spec_permissions_diagnostics §7.
@@ -42,6 +57,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             }
         }
         let backgroundTaskRegistrations = registerBackgroundTasks()
+        let evaluationJournal = environment.evaluationJournal
+        Task(priority: .utility) { await evaluationJournal.reconcileOrphans() }
         let refreshSubmissionError = environment.appRefreshScheduler.scheduleRegularRefresh()
         // 1ª submissão — sem isso o handler registrado acima nunca é chamado pelo iOS.
         Task { await environment.offlineSyncCoordinator.start() }   // observa reconexão (NWPathMonitor) → drena
@@ -65,20 +82,39 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
                     details: [
                         "refresh": String(backgroundTaskRegistrations.refresh),
                         "processing": String(backgroundTaskRegistrations.processing),
-                        "refreshSubmissionError": refreshSubmissionError ?? "none"
+                        // O relatório Debug não persiste `Error` bruto. O Simulator só precisa distinguir
+                        // scheduled de indisponibilidade conhecida para manter o resultado inconclusivo.
+                        "refreshSubmission": Self.validationRefreshSubmission(
+                            from: refreshSubmissionError
+                        )
                     ]
                 )
                 let requests = await BGTaskScheduler.shared.pendingTaskRequests()
-                let identifiers = requests.map(\.identifier).sorted().joined(separator: ",")
                 await BackgroundValidationRecorder.shared.record(
                     "bg_task_pending_requests",
-                    details: ["identifiers": identifiers]
+                    details: [
+                        "count": String(requests.count),
+                        "hasRefresh": String(
+                            requests.contains { $0.identifier == BGTaskAppRefreshScheduler.taskIdentifier }
+                        ),
+                        "hasProcessing": String(
+                            requests.contains { $0.identifier == BGTaskSyncScheduler.taskIdentifier }
+                        )
+                    ]
                 )
             }
         }
 #endif
         return true
     }
+
+#if DEBUG
+    private static func validationRefreshSubmission(from errorDescription: String?) -> String {
+        guard let errorDescription else { return "scheduled" }
+        // Só a categoria estável cruza o boundary do report; `errorDescription` nunca é gravada.
+        return errorDescription.contains("BGTaskSchedulerErrorDomain Code=1") ? "unavailable" : "rejected"
+    }
+#endif
 
     private func registerNotificationCategories() {
         let open = UNNotificationAction(
@@ -122,47 +158,130 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             using: .main
         ) { task in
             nonisolated(unsafe) let bgTask = task     // BGTask não é Sendable; usado serialmente aqui
-            let work = Task {
+            let systemTask = UIKitSystemBackgroundTaskAdapter(task: bgTask)
+            AppDelegateBackgroundTaskHandlerRouter.install(
+                profile: self.environment.backgroundReliabilityProfile,
+                task: systemTask,
+                startCandidate: {
+                    let trigger = refreshScheduler.triggerForPendingRefresh()
+                    let controller = BGAppRefreshExecutionController(
+                        startEvaluation: { trigger, ownerRegistration in
 #if DEBUG
-                if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
-                    await BackgroundValidationRecorder.shared.record("bg_app_refresh_started")
-                }
+                            if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
+                                await BackgroundValidationRecorder.shared.record("bg_app_refresh_started")
+                            }
 #endif
-                let trigger = refreshScheduler.triggerForPendingRefresh()
-                await orchestrator.runOnce(trigger)
-                // Reagendar "regular" preserva os deadlines persistidos de precisão e pausa no mesmo request.
-                refreshScheduler.scheduleRegularRefresh()
+                            return await orchestrator.evaluationTicket(
+                                trigger,
+                                ownerRegistration: ownerRegistration
+                            )
+                        },
+                        scheduleRegularRefresh: {
+                            // Reagendar "regular" preserva os deadlines persistidos de precisão e pausa.
+                            _ = refreshScheduler.scheduleRegularRefresh()
+                        }
+                    )
+                    let handle = controller.start(trigger: trigger) { success in
 #if DEBUG
-                if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
-                    await BackgroundValidationRecorder.shared.record("bg_app_refresh_completed")
-                }
+                        if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
+                            Task {
+                                await BackgroundValidationRecorder.shared.record(
+                                    "bg_app_refresh_completed",
+                                    details: ["success": String(success)]
+                                )
+                            }
+                        }
 #endif
-                bgTask.setTaskCompleted(success: true)
-            }
-            bgTask.expirationHandler = { work.cancel() }
+                        bgTask.setTaskCompleted(success: success)
+                    }
+                    // A expiração é síncrona: ela só marca/libera este owner e o trabalho canônico faz
+                    // journal + cleanup antes do terminal quando este era o último orçamento válido.
+                    return SystemBackgroundTaskExpirationHandle { _ = handle.expire() }
+                },
+                startLegacy: {
+                    // `legacyWithDiagnostics` continua no handler histórico e não instancia o controller.
+                    let work = Task {
+#if DEBUG
+                        if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
+                            await BackgroundValidationRecorder.shared.record("bg_app_refresh_started")
+                        }
+#endif
+                        let trigger = refreshScheduler.triggerForPendingRefresh()
+                        await orchestrator.runOnce(trigger)
+                        // Reagendar "regular" preserva os deadlines persistidos de precisão e pausa no mesmo request.
+                        refreshScheduler.scheduleRegularRefresh()
+#if DEBUG
+                        if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
+                            await BackgroundValidationRecorder.shared.record("bg_app_refresh_completed")
+                        }
+#endif
+                        bgTask.setTaskCompleted(success: true)
+                    }
+                    return SystemBackgroundTaskExpirationHandle { work.cancel() }
+                }
+            )
         }
         // Replay da fila offline (port de SyncPendingChecksWorker) — dispara o drain do coordenador.
         let coordinator = environment.offlineSyncCoordinator
+        let backgroundProcessingScheduler = environment.backgroundProcessingScheduler
         let processingRegistered = BGTaskScheduler.shared.register(
             forTaskWithIdentifier: Self.processingTaskID,
             using: .main
         ) { task in
             nonisolated(unsafe) let bgTask = task     // BGTask não é Sendable; usado serialmente aqui
-            let work = Task {
+            let systemTask = UIKitSystemBackgroundTaskAdapter(task: bgTask)
+            AppDelegateBackgroundTaskHandlerRouter.install(
+                profile: self.environment.backgroundReliabilityProfile,
+                task: systemTask,
+                startCandidate: {
+                    let controller = BGProcessingExecutionController(
+                        startDrain: {
 #if DEBUG
-                if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
-                    await BackgroundValidationRecorder.shared.record("bg_processing_started")
-                }
+                            if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
+                                await BackgroundValidationRecorder.shared.record("bg_processing_started")
+                            }
 #endif
-                await coordinator.triggerDrain()
+                            return await coordinator.drainTicket()
+                        },
+                        scheduleProcessing: {
+                            // Reenvia apenas o request oportunista; não inicia um segundo drain em loop.
+                            backgroundProcessingScheduler.rescheduleBackgroundProcessing()
+                        }
+                    )
+                    let handle = controller.start { success in
 #if DEBUG
-                if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
-                    await BackgroundValidationRecorder.shared.record("bg_processing_completed")
-                }
+                        if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
+                            Task {
+                                await BackgroundValidationRecorder.shared.record(
+                                    "bg_processing_completed",
+                                    details: ["success": String(success)]
+                                )
+                            }
+                        }
 #endif
-                bgTask.setTaskCompleted(success: true)
-            }
-            bgTask.expirationHandler = { work.cancel() }
+                        bgTask.setTaskCompleted(success: success)
+                    }
+                    return SystemBackgroundTaskExpirationHandle { _ = handle.expire() }
+                },
+                startLegacy: {
+                    // `legacyWithDiagnostics` continua no handler histórico e não instancia o controller.
+                    let work = Task {
+#if DEBUG
+                        if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
+                            await BackgroundValidationRecorder.shared.record("bg_processing_started")
+                        }
+#endif
+                        await coordinator.triggerDrain()
+#if DEBUG
+                        if UserDefaults.standard.bool(forKey: "debug.background_validation.enabled") {
+                            await BackgroundValidationRecorder.shared.record("bg_processing_completed")
+                        }
+#endif
+                        bgTask.setTaskCompleted(success: true)
+                    }
+                    return SystemBackgroundTaskExpirationHandle { work.cancel() }
+                }
+            )
         }
         return (refreshRegistered, processingRegistered)
     }
@@ -186,7 +305,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ application: UIApplication,
                      didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        AppLog.background.error("APNs registration failed: \(error.localizedDescription, privacy: .public)")
+        // Não promover descrições de erro do sistema ao log exportável.
+        AppLog.background.error("APNs registration failed.")
     }
 
     func application(
@@ -196,11 +316,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     ) {
 #if DEBUG
         if BackgroundValidationHarness.isEnabled {
-            let validationValue = userInfo["checking_validation"] as? String ?? "absent"
+            let hasValidationMarker = userInfo["checking_validation"] != nil
             Task {
                 await BackgroundValidationRecorder.shared.record(
                     "remote_notification_received",
-                    details: ["checkingValidation": validationValue]
+                    details: ["hasValidationMarker": String(hasValidationMarker)]
                 )
                 completionHandler(.newData)
             }

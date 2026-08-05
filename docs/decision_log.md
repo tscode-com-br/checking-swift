@@ -86,14 +86,19 @@ Cada decisão adotada **precisa de um teste Swift** que afirme o comportamento e
 
 ## D6 — "Apagar dados deste dispositivo" não limpa a fila offline criptografada
 
-- **Status:** confirmado (lacuna LGPD art. 18).
+- **Status:** confirmado no Android; correção iOS implementada e coberta localmente.
 - **Evidência:**
   - `presentation/privacy/PrivacyViewModel.kt:43-52` (`deleteLocalData`) executa 5 passos crash-guarded: `AutoActivityController.stop`, `authRepository.logout()` (cookies), `activityLog.clear()` (**Room — é limpo**), `securePasswordStore.clearAll()` (senhas), `appPrefs.clearAll()` (DataStore). O construtor (`:26-32`) **não injeta** `OfflineCheckQueue`/`OfflineQueueStore`.
   - `platform/background/offline/EncryptedOfflineQueueStore.kt:24-68` — arquivo `checking_offline_queue` (`:35`), key `pending_checks_json` (`:66`); migração legada que move o dado do DataStore cleartext para o arquivo cifrado e limpa o legado (`:54-63`). **Não expõe** `clear/clearAll/deleteAll` (grep confirma nenhum).
   - `data/local/AppPreferencesDataSource.kt:65` — `clearAll()` = `dataStore.edit { it.clear() }` (só DataStore); comentários `:63-64` e `PrivacyViewModel.kt:49` ("DataStore: ... offline queue") são **obsoletos**.
-- **Correção de precisão:** o **Room (activity log) É limpo** (via `activityLog.clear()`), tanto no wipe de privacidade quanto no `deleteAccount` remoto (`CheckViewModel.kt:1211-1223`). A **única residual confirmada** é a **fila offline criptografada** (GPS preciso), que sobrevive ao wipe.
+- **Correção de precisão do diagnóstico Android:** o **Room (activity log) É limpo** (via
+  `activityLog.clear()`), tanto no wipe de privacidade quanto no `deleteAccount` remoto
+  (`CheckViewModel.kt:1211-1223`). A **única residual confirmada no Android** é a fila offline criptografada
+  (GPS preciso), que sobrevive ao wipe.
 - **Comportamento Android (produção):** limpa DataStore + senhas + cookies + Room + para o motor; **deixa a fila offline criptografada** intacta.
-- **Decisão iOS:** **corrigir** — o wipe LGPD inclui explicitamente um passo crash-guarded que limpa o equivalente iOS da fila offline (Keychain/arquivo cifrado). Expor um método `clear()` na fila (que hoje não existe).
+- **Decisão iOS:** **corrigido** — wipe local e delete remoto aceito primeiro invalidam/quiescem a automação e
+  então limpam o journal, a fila offline, ActivityLog, EvaluationLog, credenciais e preferências. Delete que
+  falha ou retorna 409 preserva sessão e dados. A fila iOS expõe e usa `clear()`; não é mais TODO.
 - **Natureza:** Corrigir.
 
 ---
@@ -101,6 +106,77 @@ Cada decisão adotada **precisa de um teste Swift** que afirme o comportamento e
 ## D7 — (dobrado em D2)
 
 O hardcode `automaticActivitiesEnabled = true` em `AccidentViewModel.kt:81` é a segunda face do mesmo defeito de D2 e é resolvido pela mesma correção (passar o flag real em todos os call-sites de `inquiryScenario`).
+
+---
+
+## D8 — Perfil de confiabilidade e promoção
+
+- **Status:** configuração vigente; promoção pendente de aprovação humana.
+- **Decisão iOS:** `Debug`, `Staging` e `Release` permanecem `legacyWithDiagnostics`. `candidate` é exercitado
+  por injeção/override local temporário e pela configuração isolada, não-shipping, `PhysicalValidation`, que
+  serve exclusivamente ao pré-voo agregado; ela não promove Release. `candidateWithMovementExperiment` não é
+  selecionado. O profile vem do bundle, escolhe um motor por vez e não é kill switch remoto. Rollback de
+  Release exige novo build/revert, não uma flag remota.
+- **Pendente explícito:** a escolha final do perfil de Release, o artefato Release-exato e qualquer archive,
+  assinatura de distribuição, TestFlight ou upload continuam condicionados aos gates técnicos e à aprovação
+  final registrada. `PhysicalValidation` ainda não autoriza ação no Apple Developer Portal.
+
+## D9 — Frescor da amostra no candidato
+
+- **Status:** aprovado para ensaio local; ainda não calibrado por percurso físico.
+- **Decisão iOS:** `maximumAge = 10 s` e `futureTolerance = 2 s`. A amostra é revalidada imediatamente antes
+  do matcher. Os valores só se aplicam ao candidato, não são SLO nem promessa de rollout.
+
+## D10 — Ordem, captura e pending dos wakes candidatos
+
+- **Status:** aprovado e testado localmente.
+- **Decisão iOS:** ordem `gates/projeto/opções/pausa → captura → movimento → revalidação/match → state quando
+  necessário → matriz → submit/fila`. TIMER faz no máximo uma captura. Há no máximo um pending normal, e a
+  ordem de drain é `pause transition → pause activation → foreground/pause reconciliation → pending normal →
+  accuracy retry → acidente`.
+- **Natureza:** divergência deliberada do drop Kotlin: o follow-up bounded conserva o wake normal sem permitir
+  motor paralelo; `coalesced`/`deferred` não são terminal e o waiter aguarda o ticket canônico.
+
+## D11 — Completion de BGTask e cancelamento
+
+- **Status:** mapping aprovado e testado localmente; hardware continua pendente.
+- **Decisão iOS:** o Bool de `setTaskCompleted` relata conclusão controlada do trabalho do sistema, não sucesso
+  do check-in. Terminais conhecidos/gates processados, `noAction`, `skip`, fila offline durável e rejeição
+  permanente processada retornam `true`. `expired`, `cancelled` sem handoff durável,
+  `submissionOutcomeUnknown`, `internalFailure` ou não admissão retornam `false`. Reagendamento, lease e
+  completion são exactly-once; expiração de um owner não cancela outro owner válido.
+
+## D12 — Idempotência de submit e `submissionOutcomeUnknown`
+
+- **Status:** bloqueio externo; não há aprovação para retry/enqueue automático.
+- **Decisão iOS vigente:** se submit já foi despachado e cancelamento torna a resposta indeterminada, terminar
+  `submissionOutcomeUnknown`, completar BGTask com `false` e não criar segunda submissão,
+  `PendingCheckEvent.Decided`, marker ou schema novo. `clientEventId`/`eventTime` são preservados pelo
+  cliente/fila, mas isso **não** prova deduplicação server-side. Submit 401/403 é outro terminal
+  (`unauthorized`) e também não reloga, repete ou enfileira automaticamente.
+- **Critério para revisar:** contrato server-side e homologação que repita o mesmo par
+  `clientEventId`/`eventTime`, demonstre uma única atividade lógica, identifique ambiente/data e tenha aceite
+  do owner backend.
+- **Homologação de `Localização não Cadastrada`/HTTP 422:** a tentativa obrigatória permanece; 422 não vira
+  auth/GPS nem autoriza relogin/recaptura. Para esta homologação e para a prova de idempotência acima, owner
+  backend/produto: **não identificado no workspace**; prazo: **não registrado**. Esses campos precisam de
+  designação humana antes do gate físico/rollout.
+
+## D13 — Eligibility, handoff, monitores e movimento
+
+- **Status:** condicional.
+- **Decisão iOS:** `BackgroundLocationEligibility` é somente observacional; D5 permanece intacta e não há
+  start/stop novo por essa política. Aplicar eligibility e mover ownership nativo de monitor ficam condicionais
+  ao Prompt 22 e à evidência correspondente. Handoff persistente de avaliação não existe e só pode ser
+  considerado no Prompt 23 após decisão/evidência. O movement experiment permanece OFF; experimento de raio
+  de wake fica fora desta sequência e exige plano e aprovação próprios.
+
+## D14 — Exportação e telemetria de diagnóstico
+
+- **Status:** decisão aprovada somente para DEBUG.
+- **Decisão iOS:** exportação é gesto explícito da `PhysicalValidationScreen` DEBUG, bounded e sanitizado. Não
+  há botão/share sheet Release, upload, telemetria remota ou export automático. Produção exige nova aprovação
+  de produto/privacidade, localização e testes de acessibilidade.
 
 ---
 
@@ -114,6 +190,13 @@ O hardcode `automaticActivitiesEnabled = true` em `AccidentViewModel.kt:81` é a
 | D4 | Upload de vídeo: falso sucesso + vazamento | Corrigir | Inspecionar Result; sucesso só em `.success`; limpar temp corretamente |
 | D5 | Comentários "Always obrigatório" | Replicar comportamento | Gate = notificações + precisa; "Always" recomendado (degradado no iOS sem ele) |
 | D6 | Wipe não limpa fila offline | Corrigir | Wipe completo, incluindo a fila offline cifrada |
+| D8 | Perfis de confiabilidade | Build-time | Debug/Staging/Release legados; `PhysicalValidation` isolada usa candidato só no pré-voo; sem kill switch remoto |
+| D9 | Frescor candidato | Ensaio local | 10 s/2 s e revalidação antes do matcher |
+| D10 | Wakes concorrentes | Divergência deliberada | Pending normal bounded e drain ordenado |
+| D11 | Completion BGTask | Segurança de plataforma | Bool por conclusão controlada; lease/completion exactly-once |
+| D12 | Submit indeterminado | Bloqueio externo | Unknown sem retry/enqueue até homologação server-side |
+| D13 | Eligibility/handoff/movimento | Condicional | Política observacional; monitor/handoff/experimento aguardam gates |
+| D14 | Exportação | DEBUG-only | Gesto explícito, sem telemetria ou superfície Release |
 
 ## Obrigações de teste (cada decisão vira um XCTest)
 
@@ -123,3 +206,10 @@ O hardcode `automaticActivitiesEnabled = true` em `AccidentViewModel.kt:81` é a
 - **D4:** upload que retorna `.failure` ⇒ estado de **erro** (não "enviado") e o temporário **não** é deletado (fica disponível para re-tentativa); `.success` ⇒ "enviado" + temporário deletado.
 - **D5:** motor inicia com apenas notificações + localização precisa concedidas; ausência de "Always"/background ⇒ status "degradado" sem bloquear o início.
 - **D6:** após o wipe, a fila offline cifrada fica **vazia** (0 eventos), além de DataStore/senhas/cookies/Room.
+- **D8–D11:** testes de perfil, amostra, pending, leases, controllers e completion verificam seleção de um
+  motor, limites de captura/pending e exactly-once.
+- **D12:** testes locais preservam ID/tempo e verificam ausência de retry/enqueue automático; eles não são
+  prova da homologação server-side exigida.
+- **D13:** matriz pura de eligibility verifica estados/sinais sem produzir start/stop de monitor.
+- **D14:** testes de export/wipe usam sentinelas de privacidade e verificam criação somente por ação DEBUG e
+  cleanup idempotente.

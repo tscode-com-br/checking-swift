@@ -9,6 +9,57 @@ Fontes: [CheckViewModel.kt](../../kotlin/app/src/main/java/br/com/tscode/checkin
 
 ---
 
+## 0. Estado iOS efetivamente implementado — atualização de 2026-08-04
+
+> **Regra de leitura.** Os fluxos abaixo preservam o baseline Kotlin e o comportamento histórico do
+> `legacyWithDiagnostics`. Em conflito, esta seção descreve o candidato efetivamente testado. `Debug`,
+> `Staging` e `Release` persistem o legado; o candidato só foi construído por injeção local, sem autorização
+> para promoção, artefato físico Release-equivalente ou distribuição.
+
+### Restore e ciclo de cena
+
+O candidato separa restore local de restore remoto. No init/cold launch headless ele restaura somente estado
+local seguro (preferências/Keychain e contexto necessário), sem UI remota, sem `probeStatus` remoto e sem
+limpar/adotar cookie. O restore remoto só pode ocorrer após `sceneStateDidChange(.active)`; a primeira
+ativação é single-flight e protegida por fences de cena, identidade e sessão. O `onForegroundResume` histórico
+não é usado para disparar remote work no candidato. Assim, um wake de background não recria a UI nem inicia
+network por efeito colateral do launch.
+
+### Sessão, relogin e submit
+
+`AuthSessionCoordinator` é compartilhado pelo `AppEnvironment` e serializa mutações de sessão também através
+de `await`. Troca de identidade e logout invalidam a geração síncronamente; respostas HTTP/cookies tardios só
+podem ser adotados pela geração ainda corrente. Waiter cancelado não cancela o refresh silencioso compartilhado
+dos demais.
+
+Em uma avaliação candidata, o orçamento de autenticação permite no máximo uma recuperação para a dependência
+que recebeu `unauthorized`: somente `options`, `state` ou `match` repetem. Retry de match reutiliza a mesma
+`LocationSample` apenas se ela for revalidada fresca imediatamente antes do matcher. Submit que recebe
+401/403 termina `unauthorized`, sem relogin, segunda submissão ou enqueue automático. HTTP 422 continua
+`.http`/`httpRejected`: não é auth, GPS nem autorização para recapturar/relogar; a tentativa obrigatória em
+`Localização não Cadastrada` continua sendo responsabilidade do fluxo normal e depende de homologação do
+backend.
+
+O cliente e a fila existente preservam o mesmo `clientEventId`/`eventTime` no replay de um evento já durável.
+Isso não permite retry de submit: resposta indeterminada após request já despachado termina
+`submissionOutcomeUnknown`, sem novo evento, `PendingCheckEvent.Decided`, marker ou alteração de schema até
+existir contrato server-side e homologação aprovada de idempotência.
+
+### Wipe e exclusão
+
+Wipe local e delete remoto bem-sucedido primeiro invalidam/quiescem automação e então limpam journal, fila
+offline, ActivityLog, EvaluationLog, credenciais e preferências. Delete só limpa depois da resposta remota
+aceita; falha, inclusive 409, preserva sessão e dados. Esta é a correção implementada da lacuna D6, e não uma
+promessa futura.
+
+### Evidência e limite
+
+`AuthSessionCoordinatorTests` (19), `CheckViewModelHeadlessLifecycleTests` (27),
+`TimerSingleCaptureTests` (25), `DurableEvaluationTerminalTests` (18) e `SafeApiCallTests` (14) cobrem os
+contratos locais acima. A auditoria integrada mais recente aprovou 163 cenários, 1.156 testes unitários Debug
+e 28 UI; essas contagens têm sobreposição e são evidência local/Simulator, não homologação do backend nem
+teste físico do candidato.
+
 ## 1. Arquitetura alvo
 
 | Kotlin | Swift | Nota |
@@ -163,7 +214,10 @@ Contrato: leitura de chave ausente → default; escrita = round-trip **verbatim*
 
 Jobs canceláveis: `passwordVerifyTask`, `checkSseTask`, `pendingApprovalPollTask`.
 
-**init**: restaura idioma; lê `pref_chave`; se `count==4` → carrega senha guardada + settings, popula uiState, `isInitializing=false`, `probeStatus`; senão só `isInitializing=false`. *(Só lê `userSettingsJson` quando a chave tem 4 chars — cuidado no port do init.)*
+**init legado**: restaura idioma; lê `pref_chave`; se `count==4` → carrega senha guardada + settings,
+popula uiState, `isInitializing=false`, `probeStatus`; senão só `isInitializing=false`. *(Só lê
+`userSettingsJson` quando a chave tem 4 chars — cuidado no port do init.)* O candidato usa o restore local
+headless descrito em §0 e não deve tratar este fluxo como regra única.
 
 **onChaveChanged(raw)**: `sanitize`; cancela `passwordVerifyTask`; `stopPolling`; `stopStream`; reseta uiState (chave + limpa authStatus/prompt/notif/history/dialog/dismissed); persiste chave; se `count != 4` → `logout()` e retorna; senão carrega senha guardada (seta se não-vazia) + `probeStatus`.
 
@@ -192,12 +246,16 @@ Jobs canceláveis: `passwordVerifyTask`, `checkSseTask`, `pendingApprovalPollTas
 
 **Trocar/criar senha** (`submitPasswordChange`): valida old (se `hasPassword`, `3..10`), new (`3..10`), confirm; `changePassword` (se hasPassword) senão `registerPassword`; `.success`: `setPassword`, fecha dialog+dismiss; se authenticated → `onAuthenticationSucceeded`.
 
-**onForegroundResume** — precedência: (1) `isAwaitingApproval` → só re-`probeStatus`; senão (2) `isAuthenticated` → `refreshCheckState` + (se `automaticActivitiesEnabled`) `orchestrator.runOnce(.foreground)`; senão (3) nada.
+**onForegroundResume legado** — precedência: (1) `isAwaitingApproval` → só re-`probeStatus`; senão (2)
+`isAuthenticated` → `refreshCheckState` + (se `automaticActivitiesEnabled`) `orchestrator.runOnce(.foreground)`;
+senão (3) nada. O candidato usa a barreira de cena `.active` de §0 e não inicia remote work no cold launch.
 
 **handleAuthExpiry** (401/403): `stopStream`; `authStatus.authenticated=false`; limpa flags/notif/userProjects/history/location; `showAutoActivitiesNudge=false`. **Mantém** chave/senha (permite re-entrar).
 
 **deleteAccount** (LGPD art. 18): `deleteAccount()` → `.success`: `AutoActivityController.stop`, `activityLog.clear`, `securePasswordStore.clearAll`, `appPreferences.clearAll`, `stopStream`, `stopPolling`, reset uiState `CheckUiState(isInitializing:false)`; `.failure` `Conflict(409)` → `settings.deleteAccountBlocked`, else `settings.deleteAccountFailed` (`.error`).
-> ⚠️ **Lacuna D6 também aqui:** este wipe **não** limpa a fila offline cifrada (nem o `PrivacyViewModel`). O port iOS deve incluir `offlineQueue.clear()` neste fluxo **e** no de privacidade.
+> **Atualização D6:** a lacuna foi corrigida: o fluxo iOS atual invalida/quiesce automação e limpa
+> `offlineQueue`, journal e demais dados locais somente depois do DELETE remoto aceito; falha/409 preserva
+> sessão e dados. Ver §0 e D6 no decision log.
 
 ## 7. Concorrência e tempo (Swift)
 
@@ -263,14 +321,15 @@ Chaves: `auth.awaitingApproval` (pt: "Aguardando aprovação de cadastro."), `au
 - Builders: `status(found,hasPassword,authenticated,pendingApproval,queueFull,chave="NEW1")`, `statusDto(...)`/`selfRegDto(...)` (self-reg: `hasPassword=authenticated`, `projects=["P80"]`, `activeProject = authenticated ? "P80" : ""`), `Project(id,name,transportEnabled)`.
 - **Idiomas de tempo:** `advanceUntilIdle` (quiescência — só onde **não** há poll pendente) vs `runCurrent` (não cruza o `sleep(10s)` — para todo caso awaiting/pending). Teardown dos testes awaiting: `onChaveChanged("")` para cancelar o poll antes de drenar, senão o teste trava.
 
-## 11. Checklist de fidelidade
+## 11. Checklist histórico de fidelidade
 - [x] `sanitizeSettingsChave`: uppercase **antes** do regex; `take(4)`; gate `count==4` em todo lugar.
 - [x] Duas regras de senha (`3..10` criar / `1..10` verificar) — usar a correta em cada ponto (a verify gate do debounce).
 - [x] Debounce 800ms cancelável; polling 10s com guardas; ambos canceláveis por troca de chave.
-- [x] `probeStatus` faz `logout()` **primeiro**.
+- [x] `probeStatus` legado faz `logout()` **primeiro**; candidato usa restore de sessão preservado (§0).
 - [x] `selfRegister.found = (status == "registered")`; `chave` do argumento; 3 saídas (registered/pending/queue_full); senha **sempre** salva.
 - [x] `logout` sempre `.success` + limpa cookie; `deleteAccount` limpa cookie **só** em sucesso; **409 mantém sessão**.
-- [x] `handleAuthExpiry` mantém chave/senha; wipe do `deleteAccount` inclui **fila offline** — TODO(D6) marcado no código (`offlineQueue.clear()` ainda não ligado — falta plugar no `AppEnvironment`).
+- [x] `handleAuthExpiry` mantém chave/senha; wipe local e delete aceito incluem journal/fila offline e dados
+  locais, enquanto falha/409 preserva sessão (D6 implementada).
 - [x] Multi-conta: senhas/settings por chave (JSON/mapa); trocar chave restaura outro conjunto. Senhas no Keychain real (`AfterFirstUnlockThisDeviceOnly`).
 - [x] Chaves de preferência e defaults idênticos; round-trip verbatim.
 - [x] Tons/i18n keys exatos; DTOs com defaults e snake_case.
@@ -281,7 +340,11 @@ chave `4` (uppercase alfanum.) · senha criar `3..10` / verificar `1..10` · deb
 
 ## 13. Implementação (slice, 2026-07-16)
 
-Implementado e verde (305 testes): `ClientStateFunctions`/`UserSettings`/`resolveFallbackProjects`/`resolveFallbackActiveProject` (funções puras), `AuthStatus`, DTOs de auth, `AuthApi`/`AuthApiLive`, `AuthRepository`/`AuthRepositoryLive` (mapeamento 1:1), `UserDefaultsPreferencesStore`, `InMemorySecurePasswordStore` (backend cifrado real adiado), `CheckUiState`, `CheckViewModel` (`@Observable @MainActor`, fatia auth completa). Plugado em `AppEnvironment.live()` (`authRepository`, `appPreferences`, `securePasswordStore`) — o `BackgroundCheckOrchestrator` já aceita essas peças reais via seam, mas segue não instanciado no `AppEnvironment` (falta `accidentRepository` + `notifications`).
+Registro histórico do slice (2026-07-16): `ClientStateFunctions`/`UserSettings`/
+`resolveFallbackProjects`/`resolveFallbackActiveProject` (funções puras), `AuthStatus`, DTOs de auth,
+`AuthApi`/`AuthApiLive`, `AuthRepository`/`AuthRepositoryLive`, stores e `CheckViewModel`. O estado atual já
+instancia e compartilha o orquestrador e `AuthSessionCoordinator` pelo `AppEnvironment`; não usar a descrição
+histórica de dependências pendentes como estado atual.
 
 **Atualização física, 21/07/2026:** `.live()` passou a usar `KeychainSecurePasswordStore` e
 `KeychainSessionCookieStore`, ambos com `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. Três testes de

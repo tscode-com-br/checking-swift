@@ -26,6 +26,9 @@ final class BackgroundAccidentVideoUploader: NSObject, AccidentVideoUploading, @
     private struct TaskContext {
         let continuation: CheckedContinuation<Data, Error>
         let onProgress: @Sendable (Double) -> Void
+        /// Efêmero e process-local. Não entra no `taskDescription`, portanto uma task restaurada não pode
+        /// adotar Set-Cookie sem comprovar a geração da requisição original.
+        let cookieRequestGeneration: UInt64
         var responseData = Data()
     }
 
@@ -94,7 +97,8 @@ final class BackgroundAccidentVideoUploader: NSObject, AccidentVideoUploading, @
         request.setValue(xClient, forHTTPHeaderField: "X-Client")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        if let cookie = cookieStore.cookieHeader(for: url) {
+        let cookieSnapshot = cookieStore.requestSnapshot(for: url)
+        if let cookie = cookieSnapshot.cookieHeader {
             request.setValue(cookie, forHTTPHeaderField: "Cookie")
         }
 
@@ -105,7 +109,8 @@ final class BackgroundAccidentVideoUploader: NSObject, AccidentVideoUploading, @
             lock.withLock {
                 contexts[task.taskIdentifier] = TaskContext(
                     continuation: continuation,
-                    onProgress: onProgress)
+                    onProgress: onProgress,
+                    cookieRequestGeneration: cookieSnapshot.generation)
             }
             task.resume()
         }
@@ -186,6 +191,20 @@ final class BackgroundAccidentVideoUploader: NSObject, AccidentVideoUploading, @
         return try? JSONCoding.decoder.decode(TaskMetadata.self, from: data)
     }
 
+    /// Adota cookies somente quando o processo ainda possui o token efêmero da requisição original.
+    /// Tasks restauradas após relaunch não têm esse token e, por segurança, ignoram Set-Cookie.
+    func adoptResponseCookies(
+        for url: URL,
+        headerFields: [String: String],
+        requestGeneration: UInt64?
+    ) {
+        guard let requestGeneration else { return }
+        cookieStore.saveFromResponse(
+            url,
+            headerFields: headerFields,
+            requestGeneration: requestGeneration)
+    }
+
     private func finish(task: URLSessionTask, error: Error?) {
         let taskID = task.taskIdentifier
         let context = lock.withLock { contexts.removeValue(forKey: taskID) }
@@ -205,7 +224,12 @@ final class BackgroundAccidentVideoUploader: NSObject, AccidentVideoUploading, @
                 guard let key = key as? String, let value = value as? String else { return nil }
                 return (key, value)
             })
-            if let url = task.originalRequest?.url { cookieStore.saveFromResponse(url, headerFields: fields) }
+            if let url = task.originalRequest?.url {
+                adoptResponseCookies(
+                    for: url,
+                    headerFields: fields,
+                    requestGeneration: context?.cookieRequestGeneration)
+            }
             if (200..<300).contains(response.statusCode) {
                 do {
                     _ = try JSONCoding.decoder.decode(AccidentVideoUploadResponse.self, from: responseData)

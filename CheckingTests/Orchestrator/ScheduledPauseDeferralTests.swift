@@ -145,7 +145,7 @@ final class ScheduledPauseDeferralTests: XCTestCase {
         XCTAssertTrue(notifications.pausePosts.isEmpty)
 
         await chaveGate.release()
-        await occupiedRun.value
+        _ = await occupiedRun.value
         await waitUntil { await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive) }
 
         let isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
@@ -592,6 +592,14 @@ final class ScheduledPauseDeferralTests: XCTestCase {
         clock.advance(BackgroundCheckOrchestrator.scheduledPauseActivationDelay)
         await sleeper.releaseNext()
         await waitUntil { notifications.reauthPosts == ["pt"] }
+        await waitUntil {
+            let activationAt = await sut.scheduledPauseActivationAtForTest
+            let waitingCount = await sleeper.waitingCount()
+            return activationAt == nil
+                && waitingCount == 0
+                && prefs.scheduledPauseDeferralJsonValue.contains(
+                    "\"phase\":\"awaitingCheckout\"")
+        }
 
         let activationAt = await sut.scheduledPauseActivationAtForTest
         let waitingCount = await sleeper.waitingCount()
@@ -602,6 +610,45 @@ final class ScheduledPauseDeferralTests: XCTestCase {
         XCTAssertEqual(scheduler.scheduledPauseDates.count, 1)
         XCTAssertEqual(notifications.reauthPosts, ["pt"])
         XCTAssertTrue(prefs.scheduledPauseDeferralJsonValue.contains("\"phase\":\"awaitingCheckout\""))
+    }
+
+    func test_sessionInvalidatedWhilePauseStateIsInFlightCannotPersistActivateOrNotify() async {
+        let now = iso("2026-06-18T09:09:09Z")
+        let prefs = preferences()
+        let repository = FakeCheckRepository()
+        repository.getStateResult = .success(
+            state(.checkOut, at: now.addingTimeInterval(-60)))
+        let stateGate = AsyncGate()
+        repository.getStateGate = stateGate
+        let notifications = SpyNotifications()
+        let scheduler = SpyAppRefreshScheduler()
+        let coordinator = OrchestratorAuthSessionCoordinator(
+            authRepository: NoopAuthRepository(),
+            securePasswordStore: NoopSecurePasswordStore())
+        let auto = SpyAutoActivities()
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: repository,
+            autoActivities: auto,
+            notifications: notifications,
+            clock: FixedClock(now),
+            authSessionCoordinator: coordinator,
+            appRefreshScheduler: scheduler)
+
+        let evaluation = Task { await sut.runOnce(.foreground) }
+        await waitUntil { repository.getStateCallCount == 1 }
+
+        _ = coordinator.invalidateCurrentIdentity()
+        await stateGate.release()
+        let completion = await evaluation.value
+        let isPaused = await prefs.getFlag(BackgroundCheckOrchestrator.flagPauseActive)
+
+        XCTAssertEqual(completion.outcome, .staleContext)
+        XCTAssertEqual(auto.callCount, 0)
+        XCTAssertFalse(isPaused)
+        XCTAssertTrue(prefs.scheduledPauseDeferralJsonValue.isEmpty)
+        XCTAssertTrue(notifications.pausePosts.isEmpty)
+        XCTAssertTrue(scheduler.scheduledPauseDates.isEmpty)
     }
 
     func test_coldRestart_restoresGrace_andBGTriggerRevalidatesBeforeActivation() async {
@@ -771,7 +818,7 @@ final class ScheduledPauseDeferralTests: XCTestCase {
         XCTAssertGreaterThan(scheduler.clearTransitionDeadlineCount, 0)
     }
 
-    func test_contextInvalidationBarrier_doesNotDeleteRuntimeCreatedByWaitingCallback() async {
+    func test_contextInvalidationBarrier_rejectsCallbackThatArrivedDuringTransition() async {
         let now = iso("2026-06-18T09:09:09Z")
         let prefs = preferences()
         let languageGate = AsyncGate()
@@ -797,7 +844,10 @@ final class ScheduledPauseDeferralTests: XCTestCase {
         await accepted.value
 
         let activationAt = await sut.scheduledPauseActivationAtForTest
-        XCTAssertEqual(activationAt, now.addingTimeInterval(10))
+        XCTAssertNil(activationAt)
+        XCTAssertTrue(
+            prefs.scheduledPauseDeferralJsonValue.isEmpty,
+            "callback recebido dentro da transição não pode reidratar runtime do contexto anterior")
     }
 
     func test_replayFromOldChave_doesNotCancelCurrentAccuracyEpisode() async {

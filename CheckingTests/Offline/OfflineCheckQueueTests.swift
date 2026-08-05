@@ -1,8 +1,26 @@
+import Foundation
 import XCTest
 @testable import Checking
 
 // Port de OfflineCheckQueueTest.kt — cap/dedup/ordem/round-trip. Ver port_spec_offline_replay.md §9.1.
 final class OfflineCheckQueueTests: XCTestCase {
+
+    private final class BlockingWriteStore: OfflineQueueStore, @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = ""
+        let writeEntered = DispatchSemaphore(value: 0)
+        let releaseWrite = DispatchSemaphore(value: 0)
+
+        func read() -> String {
+            lock.withLock { value }
+        }
+
+        func write(_ json: String) {
+            writeEntered.signal()
+            releaseWrite.wait()
+            lock.withLock { value = json }
+        }
+    }
 
     private func raw(_ id: String, at: Int64, lat: Double = 1.0) -> PendingCheckEvent {
         .raw(.init(chave: "HR70", projeto: "P80", capturedAtEpochMs: at, clientEventId: id,
@@ -75,5 +93,79 @@ final class OfflineCheckQueueTests: XCTestCase {
         XCTAssertEqual(all.count, 200)
         XCTAssertEqual(all.first?.clientEventId, "e6")   // e1..e5 (os 5 mais antigos) descartados
         XCTAssertEqual(all.first?.capturedAtEpochMs, 6)
+    }
+
+    func test_enqueueIfCurrent_rejectsRevokedEvaluationWithoutPersisting() async {
+        let queue = makeQueue(InMemoryOfflineQueueStore())
+        let evaluationValidity = AutomaticActivitiesEvaluationValidity()
+        let effectGuard = AutomaticActivitiesEffectGuard(
+            sessionGeneration: AuthSessionGeneration(value: 3),
+            evaluationValidity: evaluationValidity
+        )
+        evaluationValidity.invalidate()
+
+        let accepted = await queue.enqueueIfCurrent(
+            raw("stale", at: 100),
+            effectGuard: effectGuard
+        )
+
+        XCTAssertFalse(accepted)
+        let size = await queue.size()
+        XCTAssertEqual(size, 0)
+    }
+
+    func test_enqueueIfCurrent_linearizesRevocationWithSynchronousPersistence() async {
+        let store = BlockingWriteStore()
+        let queue = makeQueue(store)
+        let evaluationValidity = AutomaticActivitiesEvaluationValidity()
+        let effectGuard = AutomaticActivitiesEffectGuard(
+            sessionGeneration: AuthSessionGeneration(value: 3),
+            evaluationValidity: evaluationValidity
+        )
+        let event = raw("current", at: 100)
+        let enqueue = Task.detached(priority: .userInitiated) {
+            await queue.enqueueIfCurrent(
+                event,
+                effectGuard: effectGuard
+            )
+        }
+
+        XCTAssertEqual(
+            store.writeEntered.wait(timeout: .now() + 1),
+            .success,
+            "a escrita síncrona deveria iniciar sob o fence"
+        )
+
+        let invalidationStarted = DispatchSemaphore(value: 0)
+        let invalidationFinished = DispatchSemaphore(value: 0)
+        DispatchQueue(
+            label: "offline-queue-effect-invalidation",
+            qos: .userInitiated
+        ).async {
+            invalidationStarted.signal()
+            evaluationValidity.invalidate()
+            invalidationFinished.signal()
+        }
+        XCTAssertEqual(invalidationStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(
+            invalidationFinished.wait(timeout: .now() + 0.1),
+            .timedOut,
+            "a revogação não pode ultrapassar uma escrita que já foi linearizada"
+        )
+
+        store.releaseWrite.signal()
+        let enqueueAccepted = await enqueue.value
+        XCTAssertTrue(enqueueAccepted)
+        XCTAssertEqual(invalidationFinished.wait(timeout: .now() + 1), .success)
+        let persisted = await queue.peekAll()
+        XCTAssertEqual(persisted.map(\.clientEventId), ["current"])
+
+        let rejectedAfterRevocation = await queue.enqueueIfCurrent(
+            raw("stale", at: 200),
+            effectGuard: effectGuard
+        )
+        XCTAssertFalse(rejectedAfterRevocation)
+        let finalIDs = await queue.peekAll().map(\.clientEventId)
+        XCTAssertEqual(finalIDs, ["current"])
     }
 }

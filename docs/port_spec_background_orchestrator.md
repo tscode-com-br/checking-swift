@@ -8,6 +8,108 @@ Fontes: [BackgroundCheckOrchestrator.kt](../../kotlin/app/src/main/java/br/com/t
 
 ---
 
+## 0. Estado iOS efetivamente implementado — atualização de 2026-08-04
+
+> **Regra de leitura.** As seções históricas abaixo registram o baseline Kotlin e slices de julho. Quando
+> divergirem desta seção, este é o contrato atual. Não se deve inferir que uma decisão do candidato já está
+> habilitada em um build instalável ou validada em iPhone físico.
+
+### Perfis e limite de rollout
+
+`Debug`, `Staging` e `Release` persistem `legacyWithDiagnostics`. O perfil `candidate` é exercitado por
+injeção em testes/validação local e seleciona um único motor; ele não roda ao lado do legado. O profile vem do
+bundle, é uma decisão de build-time e **não** é um kill switch remoto. `candidateWithMovementExperiment` não é
+selecionado por nenhum `.xcconfig`; o experimento permanece desligado. Promover Debug/Staging, produzir um
+artefato físico Release-equivalente ou distribuir o candidato requerem aprovações humanas separadas.
+
+O uso contínuo de `UIBackgroundModes=location`/`allowsBackgroundLocationUpdates` não faz parte do pipeline
+automático candidato. Qualquer uso existente é restrito ao harness DEBUG preexistente, não prova periodicidade
+nem deve ser descrito como estratégia distribuída.
+
+### Pipeline candidato, amostra e coalescência
+
+No candidato, a ordem aprovada é:
+
+```text
+gates/contexto + projeto + opções + pausa
+  → captura
+  → movimento
+  → revalidação imediatamente antes do matcher
+  → match
+  → state, quando necessário
+  → matriz
+  → submit ou fila offline
+```
+
+- `LocationSample` permanece somente em memória e carrega timestamp, coordenada e precisão. A política
+  `candidateTrial` aceita no máximo **10 s** de idade e **2 s** de tolerância futura; esses valores são
+  aprovados apenas como ponto de partida de ensaio, não como SLO ou calibração final de rollout.
+- Um `TIMER` candidato inicia no máximo **uma** captura física. A mesma amostra serve ao gate de movimento e,
+  se ainda válida, ao matcher. Amostra stale, futura, inválida ou de precisão insuficiente não chega ao
+  matcher e não abre uma segunda captura.
+- Um wake significativo pode transportar seed opcional. Uma seed válida/suficiente evita iniciar o driver
+  padrão; uma seed coarse pode solicitar no máximo uma melhoria. O legado descarta seed e preserva seu
+  comportamento histórico.
+- Há no máximo uma avaliação running e um pending normal bounded; wakes normais compatíveis são mesclados.
+  O waiter recebe o ticket canônico e espera seu terminal — `coalesced`/`deferred` não são terminais nem
+  concluem um BGTask por si. A ordem de drain é `pause transition → pause activation → foreground/pause
+  reconciliation → pending normal → accuracy retry → acidente`.
+
+Esse follow-up bounded é uma divergência deliberada do drop do Kotlin/legado: evita perder um wake normal
+durante trabalho em voo, sem permitir duas avaliações do motor em paralelo.
+
+### BGTask, UIKit e cancelamento
+
+`BGAppRefresh` continua oportunista: não há promessa de cadência de 15 minutos, wake após force-quit,
+relançamento por região ou entrega do daemon. No candidato, `BGAppRefreshExecutionController`,
+`BGTaskCompletionGate`, `BackgroundWorkOwnership` e a lease de UIKit fazem completion, fim de lease e
+reagendamento exatamente uma vez. A expiração síncrona só marca/libera seu owner; ela não faz `await`.
+
+O contexto de cancelamento tem razão first-wins (`bgTaskExpired`, `uiBackgroundTimeExpired`,
+`contextInvalidated`, `taskCancelled`). Expirar um owner BG/UIKit não cancela os demais: o trabalho canônico
+só é cancelado quando não resta owner com orçamento válido. `contextInvalidated` cancela todos. Guards antes e
+depois de awaits caros impedem iniciar capture, match, state ou submit depois do cancelamento.
+
+| Terminal do trabalho coberto pelo request | Bool de `setTaskCompleted` | Sentido |
+|---|---:|---|
+| `submitted`, `noAction`, `skip`, `paused`, `toggleOff`, `notConfigured`, fila offline durável ou rejeição permanente processada | `true` | trabalho do sistema concluiu de forma conhecida; não significa sucesso de check-in |
+| `expired`/`cancelled` sem handoff durável, `submissionOutcomeUnknown`, `internalFailure` ou request não admitido | `false` | não houve conclusão controlada dentro do orçamento |
+
+`BGProcessing` aplica a mesma disciplina ao drain; evento já persistido na fila é handoff durável e não é
+removido por expiração/resposta desconhecida. Não existe marker ou handoff persistente novo para avaliações.
+Se submit já foi despachado e o cancelamento torna a resposta indeterminada, o candidato termina
+`submissionOutcomeUnknown`, journaliza contexto sanitizado e completa `false`: não cria
+`PendingCheckEvent.Decided`, não muda schema/replayer e não faz retry/enqueue automático. Embora cliente e
+fila conservem `clientEventId`/`eventTime`, falta contrato server-side e homologação aprovada demonstrando uma
+única atividade lógica para repetição desse par; testes locais não suprem esse gate.
+
+### Geofences candidatas por geração
+
+O candidato mantém em memória um snapshot técnico com geração, `requested`, `confirmed`, `failed` (códigos
+em whitelist), `omitted`, `pending` e `confirmationUncertain`, sem IDs, token, local ou coordenadas. Cada
+mudança material usa identifiers físicos opacos versionados por geração (token aleatório + slot/índice opaco),
+entregues somente ao Core Location. Resync idêntico no mesmo processo preserva a geração.
+
+`didStartMonitoringFor` só confirma identifier **e** geometria do expected set atual e só então chama
+`requestState`; callback antigo, duplicado ou de geometria divergente não confirma a geração nova.
+`monitoringDidFailFor` só afeta região esperada; callback ambíguo vira `confirmationUncertain`. No relaunch,
+identifiers herdados são `inheritedUnknown`: podem gerar wake-only enquanto o contexto atual for válido, mas
+nunca contam como confirmados e são reconciliados de forma bounded. `removeAll`, logout, toggle off e troca de
+projeto invalidam o conjunto antes de pará-lo/rearmá-lo.
+
+Permanecem invariantes: cap 20, priorização tier/Haversine/id, lista vazia remove, falha de fetch preserva o
+conjunto atual, dedup de 3 s por `(região, direção)`, ENTER/EXIT opostos distintos e matching no servidor. A
+mensagem histórica byte-exact `Geofences registered (N).` significa apenas **requested**, nunca confirmação
+técnica. Identifiers/tokens não são persistidos em journal, ActivityLog, export, UserDefaults ou UI.
+
+### Evidência e limites
+
+O candidato foi coberto localmente por testes de unidade/integração, inclusive 163 cenários integrados e a
+regressão Debug de 1.156 testes; a UI Debug teve 28 testes. O harness do Simulator terminou com exit 0 e 47
+eventos sanitizados, mas classificou execução de BGAppRefresh como indisponível e push silencioso como
+inconclusivo. Isso não é validação física do candidato, nem prova de orçamento UIKit, geofence/significant,
+rádio, bateria, thermal ou comportamento do daemon.
+
 ## 1. Princípio: paridade observável, não de mecanismo
 
 A regra de ouro do plano (§2, §3.4) vale aqui: reproduzir os **resultados** que o usuário percebe (check-in/out automático ao se deslocar, alerta de acidente), não os mecanismos internos. A **lógica** do orquestrador (gate, single-flight, filtro de movimento, caches, dedup de acidente, relogin) porta 1:1. Os **gatilhos** (o que acorda o orquestrador) são reimaginados em camadas iOS, com degradação **explícita** na UX quando o iOS não permite.
@@ -28,7 +130,7 @@ A regra de ouro do plano (§2, §3.4) vale aqui: reproduzir os **resultados** qu
 
 **`runAccidentCheck()`** (independente do auto — §8): mesmo mutex; lê chave/settings; **se `!notifyAccident` → return ANTES de qualquer query**; `maybeNotifyAccident`; 401 → relogin → retry once.
 
-## 3. Single-flight (`Mutex.tryLock` → actor + flag)
+## 3. Baseline Kotlin / single-flight do legado (`Mutex.tryLock` → actor + flag)
 
 ```swift
 enum OrchestratorTrigger { case timer, geofence, foreground }
@@ -121,18 +223,21 @@ Todos os gatilhos Android convergem para `runOnce(trigger)`. No iOS, cada um vir
 
 | Mecanismo Android | Onde | Estratégia iOS | Nível |
 |---|---|---|---|
-| **FGS `foregroundServiceType=location`** + `START_STICKY` | `AutoActivityForegroundService` | `UIBackgroundModes=location` + `CLLocationManager.allowsBackgroundLocationUpdates` (sessão iniciada em foreground); indicador de localização do sistema | Parcial |
+| **FGS `foregroundServiceType=location`** + `START_STICKY` | `AutoActivityForegroundService` | Não há equivalente distribuído no candidato; `allowsBackgroundLocationUpdates` fica fora do pipeline automático e só pode existir no harness DEBUG | Ausente no candidato |
 | **Timer 15min** (imediato + `delay(15min)` loop) | FGS `timerJob` | **Sem tick garantido.** Eventos de localização + `BGAppRefreshTask` oportunista + reconciliação no foreground | Parcial (sem periodicidade) |
 | **Geofences** `NEVER_EXPIRE`, `ENTER\|EXIT`, `INITIAL_TRIGGER_ENTER` (até 100) | `GeofenceManager` | `CLLocationManagerGeofenceMonitor` region monitoring — **cap 20** com `GeofenceRegionPrioritizer` (área atual → mais próximas → id); omitidas logadas + em `lastSummary`; INITIAL_TRIGGER via `didStartMonitoringFor`→`requestState`→`didDetermineState(.inside)` (§18) | Alta, com cap 20 |
-| **Geofence → runOnce(GEOFENCE)** | `GeofenceBroadcastReceiver` | `locationManager(_:didEnterRegion:/didExitRegion:)` → `onGeofenceWake` → `runOnce(.geofence)`; region monitoring **relança** o app terminado (handler de launch pendente — §18) | Alta |
-| **Significant change** (implícito no FGS) | — | `startMonitoringSignificantLocationChanges` (exige "Always") como fallback de deslocamento amplo + oportunidade de relançamento | Parcial |
+| **Geofence → runOnce(GEOFENCE)** | `GeofenceBroadcastReceiver` | delegate encaminha wake ao orquestrador; relaunch/entrega são oportunidades do Core Location, não garantia nem prova física do candidato | Parcial |
+| **Significant change** (implícito no FGS) | — | `startMonitoringSignificantLocationChanges` exige `Always`; é oportunidade de wake, sem promessa de entrega/relançamento | Parcial |
 | **Watchdog 15min** (reinicia FGS + roda TIMER) | `AutoActivityWatchdogWorker` | `BGAppRefreshTask` / `BGProcessingTask` — **sem intervalo mínimo garantido**, throttled | Parcial |
 | **Alarme exato** (pausa start/end, `setExactAndAllowWhileIdle`) | `scheduleExactWake` (1001/1002) | `BGTaskScheduler` (`earliestBeginDate` = preferência) + `UNUserNotificationCenter` best-effort — **sem execução no instante** | Parcial |
 | **Boot / update** (`BOOT_COMPLETED`/`MY_PACKAGE_REPLACED`) | `BootReceiver` | **Ausente** — apps iOS não auto-iniciam no boot; só region/significant-change relançam (nunca num reboot sem evento de localização) | Ausente |
 | **Restart pós-swipe** (`onTaskRemoved` + alarme 1s) | FGS | **Ausente** — não há `onTaskRemoved`; force-quit suspende tudo | Ausente |
 | **Wake lock 60s** (`PARTIAL_WAKE_LOCK`) | orquestrador | `beginBackgroundTask` (prazo do sistema ~30s) para concluir a rajada; **sem loop** | Sem equivalente direto |
 
-**Restauração no foreground (Camada D — controlável pelo app):** em todo launch/`didBecomeActive`, reavaliar permissões, reconciliar sessão/estado, reproduzir a fila offline, atualizar regiões, consultar acidentes, e rodar `runOnce(.foreground)` se elegível. **É a garantia mais forte que o iOS dá** — corrige qualquer estado perdido na suspensão. (Já ligado no auth via `onAuthenticationSucceeded`/`onForegroundResume` — ver spec de auth.)
+**Restauração no foreground (Camada D — controlável pelo app):** o fluxo histórico/legado pode reconciliar no
+foreground. No candidato, o launch headless restaura somente estado local; restore remoto e qualquer trabalho
+de cena só podem ocorrer após `.active` (ver spec de auth). Isso melhora a segurança de cold launch, mas não
+promete entrega do iOS.
 
 **Degradação explícita (obrigatória):** se o usuário força o encerramento, desliga Localização, desliga Atualização em 2º Plano, ou nega "Always"/precisão exata, o **painel de integridade** deve dizer que a automação está degradada/indisponível — **nunca prometer** o que a plataforma não garante.
 
@@ -172,7 +277,7 @@ Todos os gatilhos Android convergem para `runOnce(trigger)`. No iOS, cada um vir
 - Single-flight: o Swift precisa de try-acquire **não-reentrante e não-bloqueante** — a 2ª chamada **retorna**, não aguarda. Portar o gate de suspensão do teste com uma `CheckedContinuation`/`AsyncStream` alimentada pelo teste + expectations (run2 termina enquanto run1 não).
 - `clock` é o único mock não-relaxado (inject `Clock`/`Date` provider). Wake lock → no-op no iOS, mas preservar o "release no `defer`".
 
-## 13. Checklist de fidelidade
+## 13. Checklist histórico de slices iniciais
 - [x] Single-flight não-reentrante, não-bloqueante (2ª chamada retorna); release em `defer`.
 - [x] Filtro `max(50, 2×precisão)` só em TIMER; geofence/foreground sempre avaliam.
 - [x] `offlineFallbackLocationOptions`: só `.network` dá não-nil (cache ou default 30/0).
@@ -180,11 +285,12 @@ Todos os gatilhos Android convergem para `runOnce(trigger)`. No iOS, cada um vir
 - [x] Ordem no `runOnceLocked`: auth → accident → toggle → pausa → opções → skip → engine → notif.
 - [x] Pausa: flag `scheduled_pause_active` **persistida**; transições notificadas 1× cada.
 - [x] Relogin silencioso retry-once; reauth coalescida 1h.
-- [x] Captura 15s "melhor-fix-no-timeout" (`CLLocationManagerLocationProvider` — §17). Geofence region-monitoring segue pendente (slice de localização/permissões).
+- [x] Captura 15s "melhor-fix-no-timeout" (`CLLocationManagerLocationProvider` — §17). O estado atual de
+  geofence candidato é geracional e está definido na atualização §0; esta linha não é status atual.
 - [x] Caches 45s/15min/1h; reavaliados contra a vida real do processo no iOS.
 - [~] **Camadas de gatilho** iOS: NWPathMonitor/BGTask/foreground feitos (§14); `.timer` via BGAppRefreshTask agora de fato submetido e disparando o orquestrador (§16); geofence region-monitoring (cap 20 + priorização) feito (§18); painel de integridade no slice de permissões/diagnóstico; `.foreground`/`.geofence` sem call-site real (falta a UI/`checkViewModel` + o handler de launch-por-região).
 - [~] Acidente em background: dedup + `runAccidentCheck` feitos; APNs (backend) pendente.
-- [x] 9 testes portados e verdes; prova de background em **aparelho real** (plano Fase 2) antes de congelar a configuração.
+- [x] 9 testes portados e verdes; validação física do candidato continua um gate separado antes de promoção.
 
 ## 15. Implementação — núcleo do orquestrador (slice, 2026-07-16)
 
@@ -240,7 +346,9 @@ Todos os gatilhos Android convergem para `runOnce(trigger)`. No iOS, cada um vir
 Port de GeofenceManager.kt + GeofenceBroadcastReceiver.kt. **Peça central e nova**: o Android permite 100 geofences e registra todas sem ranquear; o iOS limita a **20 regiões por app**, então a priorização determinística é lógica genuinamente nova exigida pelo plano §9.2 ("ranking determinístico e auditável", "não truncar em silêncio").
 - ✅ **`GeofenceRegionPrioritizer`** (puro, 17 testes exaustivos): chave de ordenação `(tier, distância, id)`. Tier 0 = área do check-in atual (casa com `currentLocalName`, trim + case-insensitive; cobre a "zona de saída" porque uma `CLCircularRegion` observa entrada E saída); depois proximidade por **Haversine** (grau de longitude encolhe com a latitude — euclidiano ranquearia errado); desempate final por `id` (determinismo total, sem depender de sort estável). Tiers 2/3 do plano (projeto ativo / favoritas) **colapsam** — o `GET /check/geofences` já é escopo do usuário e o círculo não carrega esse sinal; documentado, não escondido.
 - ✅ **`GeofenceRegionManager`** (actor, port de `GeofenceManager`, 8 testes com fake): fetch → prioriza → arma; engole erro e sai em lista vazia (fiel ao Kotlin); log `"Geofences registered (N)."` byte-exact; **omitidas nunca silenciosas** — WARNING dedicado + `lastSummary` (para o painel de integridade). `unregisterAll` port do estático do Kotlin.
-- ✅ **`CLLocationManagerGeofenceMonitor`** (integração, não testada por unidade — mesmo padrão de `NWPathMonitor`): reconcilia idempotentemente o conjunto monitorado (para as que sumiram, inicia as novas/alteradas, pula idênticas); `notifyOnEntry`+`notifyOnExit` (ENTER|EXIT); `id = String(circle.id)` (== `setRequestId` do Kotlin); delegate `didEnter`/`didExit` → loga travessia (location=nil, match server-side) + `onGeofenceWake` → `runOnce(.geofence)`.
+- ✅ **`CLLocationManagerGeofenceMonitor`** (registro histórico do legado): reconciliava o conjunto usando
+  `id = String(circle.id)`. O candidato substitui isso por identifiers opacos por geração, confirmação por
+  identifier+geometria e snapshot sem IDs, conforme §0; não usar este parágrafo para implementar o candidato.
 - ✅ Plugado em `AppEnvironment` (`geofenceRegionManager`), real na `.live()` e `NoopGeofenceRegionMonitor` na `.preview`.
 - 25 testes novos (17 prioritizer + 8 manager). Total 451 verdes.
 

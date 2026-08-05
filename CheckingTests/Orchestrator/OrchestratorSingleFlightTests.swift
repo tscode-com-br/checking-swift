@@ -1,16 +1,22 @@
 import XCTest
 @testable import Checking
 
-// Port de OrchestratorSingleFlightTest.kt — a 2ª chamada concorrente RETORNA (não enfileira). §12.
+// Divergência iOS intencional por perfil: o legado conserva o drop histórico; o candidate mantém um
+// pending normal bounded, coberto por PendingNormalWakeTests.
 final class OrchestratorSingleFlightTests: XCTestCase {
 
-    func test_concurrent_runOnce_is_blocked_by_single_flight() async {
+    func test_legacyProfile_concurrentRunOnce_keepsHistoricalDrop() async {
         let gate = AsyncGate()
         let prefs = FakeAppPreferences()
         prefs.chaveGate = gate; prefs.chaveValue = ""          // run1 trava no chave() segurando isRunning
         let spy = SpyAutoActivities()
         let checkRepo = FakeCheckRepository()
-        let orchestrator = makeOrchestrator(prefs: prefs, checkRepository: checkRepo, autoActivities: spy)
+        let orchestrator = makeOrchestrator(
+            prefs: prefs,
+            checkRepository: checkRepo,
+            autoActivities: spy,
+            automaticEvaluationPipeline: .legacy
+        )
 
         let run1 = Task { await orchestrator.runOnce(.timer) }
         await waitUntil { await orchestrator.isRunningForTest }  // run1 travou (isRunning = true)
@@ -19,7 +25,7 @@ final class OrchestratorSingleFlightTests: XCTestCase {
         XCTAssertEqual(spy.callCount, 0)                         // run2 não fez trabalho
 
         await gate.release()                                     // libera run1 → chave "" → return no passo 1
-        await run1.value
+        _ = await run1.value
         XCTAssertEqual(spy.callCount, 0)
         XCTAssertEqual(checkRepo.submitCount, 0)
     }

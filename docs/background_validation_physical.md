@@ -3,6 +3,44 @@
 Data de início: **21/07/2026**  
 Status: **relançamento frio e fallback de mudança significativa implementados; build físico instalado; aguardando percurso de confirmação**
 
+## Estado vinculante para o candidato de confiabilidade — 2026-08-04
+
+Nenhum ensaio físico novo foi executado nesta atualização documental. A evidência abaixo é histórica e
+permanece preservada, mas não aprova o perfil de confiabilidade `candidate` atual: todos os configs instaláveis
+(`Debug`, `Staging` e `Release`) continuam `legacyWithDiagnostics`, e não há aprovação para produzir/instalar
+um artefato físico Release-equivalente do candidato. Resultados de unitários/Simulator não substituem esse
+gate.
+
+### Linha do tempo anterior preservada — 14:11–15:34
+
+Esta transcrição registra apenas evidência anterior já analisada no plano; não representa novo ensaio nem
+altera a interpretação dos dados físicos existentes. Ida e volta permanecem separadas.
+
+**Ida / saída e chegada à unidade de teste**
+
+| Horário local | Evidência anterior | Interpretação limitada |
+|---|---|---|
+| 14:11:25 | `Background evaluation (TIMER)` seguido de `Auto-check skipped (no movement)` | ciclo anterior terminou normalmente |
+| 14:31:14–20 | EXITs de geofence, mudança significativa, fix ~25 m e tentativa em `Localização não Cadastrada` rejeitada | iOS acordou o app e GPS/matcher funcionaram; a rejeição 422 é dependência de backend separada |
+| 14:50:18 | `Background evaluation (TIMER)` sem terminal posterior observável | avaliação órfã ou observabilidade insuficiente; não contar como sucesso |
+| 15:10:33–38 | mudança significativa + ENTER; em seguida `Signed in`, registro de nove geofences, fix ~12 m e check-in na unidade de teste | avaliação/captura/matriz funcionaram quando executadas; a reconstrução de auth/UI era indício, não prova suficiente por si |
+
+**Volta / retorno ao escritório de referência**
+
+| Horário local | Evidência anterior | Interpretação limitada |
+|---|---|---|
+| 15:19:18–19 | mudança significativa, fix ~22 m, local desconhecido e tentativa rejeitada | GPS continuou operacional; 422 não pode ser mascarado nem classificado como auth/GPS |
+| 15:21:55–56 | ENTER, fix ~19 m e check-in no escritório de referência | retorno concluído pelo fluxo então em observação |
+| 15:34:14 | primeira avaliação explicitamente `FOREGROUND` após o percurso | os eventos anteriores não dependeram de abrir a tela |
+
+### Gates físicos ainda pendentes
+
+O candidato físico continua **pendente** de autorização explícita e de roteiro controlado. Permanecem sem
+aprovação/critério final: SLO de chegada, dwell mínimo, passagem sem dwell/drive-through, orçamento de
+energia/thermal, amostra de aparelhos e percursos, calibração final de frescor, reboot observado, degradação de
+permissão/precisão, push backend e homologação backend da tentativa obrigatória de `Localização não Cadastrada`.
+Não inferir aprovação desses itens a partir dos registros históricos abaixo.
+
 ## Ambiente
 
 - aparelho: iPhone 14 Pro (`iPhone15,2`);

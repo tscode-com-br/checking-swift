@@ -2,6 +2,11 @@ import XCTest
 @testable import Checking
 
 final class AccuracyRetryEpisodeTests: XCTestCase {
+    private actor CompletionProbe {
+        private(set) var completed = false
+        func markCompleted() { completed = true }
+    }
+
     private final class MutableClock: Clock, @unchecked Sendable {
         private let lock = NSLock()
         private var value: Date
@@ -36,13 +41,14 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
             lock.withLock { fallback = result }
         }
 
-        func callAsFunction(
+        func execute(
             chave: String,
             userProjects: UserProjects?,
             currentState: HistoryState?,
             mixedZoneIntervalMinutes: Int,
-            accuracyThresholdMeters: Int
-        ) async -> AutoActivitiesResult {
+            accuracyThresholdMeters: Int,
+            locationAttempt: LocationAttemptInput
+        ) async -> AutomaticActivitiesExecution {
             let snapshot: (result: AutoActivitiesResult, gate: AsyncGate?) = lock.withLock {
                 let index = calls
                 calls += 1
@@ -50,7 +56,16 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
                 return (result, gates[index])
             }
             if let gate = snapshot.gate { await gate.wait() }
-            return snapshot.result
+            return AutomaticActivitiesExecution(
+                result: snapshot.result,
+                trace: AutomaticActivitiesTrace(
+                    maximumStage: .decisionCompleted,
+                    capture: nil,
+                    failure: nil,
+                    offlineDisposition: nil
+                ),
+                submissionContext: nil
+            )
         }
     }
 
@@ -62,7 +77,10 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
         init(_ result: LocationCapture) { self.result = result }
         var callCount: Int { lock.withLock { calls } }
 
-        func capture(_ accuracyThresholdMeters: Int) async -> LocationCapture {
+        func capture(
+            _ accuracyThresholdMeters: Int,
+            seed: LocationSample?
+        ) async -> LocationCapture {
             lock.withLock { calls += 1 }
             return result
         }
@@ -225,8 +243,13 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
         XCTAssertEqual(auto.callCount, 2)
 
         await secondCallGate.release()
-        await concurrentEvaluation.value
+        _ = await concurrentEvaluation.value
         await waitUntil { auto.callCount == 3 }
+        await waitUntil {
+            let pending = await sut.hasPendingAccuracyRetryForTest
+            let episode = await sut.hasAccuracyRetryEpisodeForTest
+            return !pending && !episode
+        }
 
         let hasPendingRetry = await sut.hasPendingAccuracyRetryForTest
         let hasEpisode = await sut.hasAccuracyRetryEpisodeForTest
@@ -422,7 +445,11 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
     }
 
     func test_timerBypassesMovementSkipDuringEpisode() async {
-        let provider = CountingLocationProvider(.success(lat: 1.0, lon: 1.0, accuracyMeters: 5))
+        let provider = CountingLocationProvider(.success(ucLocationSample(
+            lat: 1.0,
+            lon: 1.0,
+            accuracyMeters: 5
+        )))
         let auto = ScriptedAutoActivities(
             [.accuracyTooLow(expectedAction: .checkIn), .locationTimeout, .noPermission])
         let sut = makeOrchestrator(
@@ -440,7 +467,11 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
     }
 
     func test_lowAccuracyPreflightNeverCreatesBaselineOrSkip() async {
-        let provider = CountingLocationProvider(.success(lat: 1.0, lon: 1.0, accuracyMeters: 80))
+        let provider = CountingLocationProvider(.success(ucLocationSample(
+            lat: 1.0,
+            lon: 1.0,
+            accuracyMeters: 80
+        )))
         let auto = ScriptedAutoActivities([], fallback: .locationTimeout)
         let sut = makeOrchestrator(
             prefs: activePreferences(),
@@ -452,6 +483,23 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
 
         XCTAssertEqual(provider.callCount, 2)
         XCTAssertEqual(auto.callCount, 2)
+    }
+
+    func test_cancelledTimerPreflightStopsBeforeAutomaticUseCase() async {
+        let provider = CountingLocationProvider(
+            .failure(.cancelled(.taskCancelled))
+        )
+        let auto = ScriptedAutoActivities([], fallback: .noAction)
+        let sut = makeOrchestrator(
+            prefs: activePreferences(),
+            autoActivities: auto,
+            locationProvider: provider
+        )
+
+        await sut.runOnce(.timer)
+
+        XCTAssertEqual(provider.callCount, 1)
+        XCTAssertEqual(auto.callCount, 0)
     }
 
     func test_invalidationDuringInFlightLowResultPreventsEpisodeRecreation() async {
@@ -472,13 +520,62 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
 
         await sut.invalidateAccuracyRetry()
         await resultGate.release()
-        await evaluation.value
+        _ = await evaluation.value
 
         let hasEpisode = await sut.hasAccuracyRetryEpisodeForTest
         XCTAssertFalse(hasEpisode)
         XCTAssertTrue(scheduler.dates.isEmpty)
         XCTAssertEqual(scheduler.clearRetryDeadlineCount, 1)
         XCTAssertEqual(notifications.lowAccuracyPosts.count, 0)
+    }
+
+    func test_contextTransitionQuiescenceDoesNotDeadlockInsideLowAccuracyEligibilityRead() async {
+        let prefs = activePreferences()
+        let resultGate = AsyncGate()
+        let eligibilityGate = AsyncGate()
+        let auto = ScriptedAutoActivities(
+            [.accuracyTooLow(expectedAction: .checkIn)],
+            gates: [0: resultGate])
+        let scheduler = SpyAppRefreshScheduler()
+        let sut = makeOrchestrator(
+            prefs: prefs,
+            autoActivities: auto,
+            appRefreshScheduler: scheduler)
+
+        let evaluation = Task { await sut.runOnce(.foreground) }
+        await waitUntil { auto.callCount == 1 }
+
+        let eligibilityRead = prefs.chaveReadCount + 1
+        prefs.chaveGate = eligibilityGate
+        prefs.chaveGateOnCall = eligibilityRead
+        await resultGate.release()
+        await waitUntil { prefs.chaveReadCount >= eligibilityRead }
+        XCTAssertGreaterThanOrEqual(prefs.chaveReadCount, eligibilityRead)
+
+        let completion = CompletionProbe()
+        let transition = Task {
+            let token = await sut.beginAutomationContextTransition()
+            await sut.awaitAutomationQuiescence(token)
+            await sut.endAutomationContextTransition(token)
+            await completion.markCompleted()
+        }
+        await waitUntil { scheduler.clearRetryDeadlineCount > 0 }
+        await eligibilityGate.release()
+        await waitUntil(timeout: 2) { await completion.completed }
+
+        let didComplete = await completion.completed
+        XCTAssertTrue(
+            didComplete,
+            "quiescence não pode aguardar uma avaliação presa ao próprio barrier")
+        if didComplete {
+            await transition.value
+            _ = await evaluation.value
+        } else {
+            transition.cancel()
+            evaluation.cancel()
+        }
+        let hasEpisode = await sut.hasAccuracyRetryEpisodeForTest
+        XCTAssertFalse(hasEpisode)
     }
 
     func test_invalidationDuringColdRestoreCannotBecomeRunBaseline() async {
@@ -491,11 +588,11 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
         let sut = makeOrchestrator(prefs: prefs, autoActivities: auto)
 
         let evaluation = Task { await sut.runOnce(.foreground) }
-        await waitUntil { await sut.isRunningForTest }
+        await waitUntil { prefs.accuracyRetryEpisodeReadStarted }
 
         await sut.invalidateAccuracyRetry()
         await restoreGate.release()
-        await evaluation.value
+        _ = await evaluation.value
 
         XCTAssertEqual(auto.callCount, 0)
         let hasEpisode = await sut.hasAccuracyRetryEpisodeForTest
@@ -522,7 +619,7 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
         XCTAssertEqual(pendingJSON["notificationPosted"] as? Bool, false)
 
         await notifications.postGate.release()
-        await evaluation.value
+        _ = await evaluation.value
 
         let postedData = try XCTUnwrap(prefs.accuracyRetryEpisodeJsonValue.data(using: .utf8))
         let postedJSON = try XCTUnwrap(
@@ -549,7 +646,7 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
 
         await sut.invalidateAccuracyRetry()
         await notifications.postGate.release()
-        await evaluation.value
+        _ = await evaluation.value
 
         let hasEpisode = await sut.hasAccuracyRetryEpisodeForTest
         XCTAssertFalse(hasEpisode)
@@ -575,7 +672,7 @@ final class AccuracyRetryEpisodeTests: XCTestCase {
         let disabled = activePreferences(automaticActivitiesEnabled: false)
         prefs.userSettingsJsonValue = disabled.userSettingsJsonValue
         await resultGate.release()
-        await evaluation.value
+        _ = await evaluation.value
 
         let hasEpisode = await sut.hasAccuracyRetryEpisodeForTest
         XCTAssertFalse(hasEpisode)
